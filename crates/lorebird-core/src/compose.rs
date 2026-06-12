@@ -173,6 +173,38 @@ impl ComposeMail {
         out
     }
 
+    /// Reconstruct a `ComposeMail` from a saved raw RFC 2822 message.
+    ///
+    /// Preserves `message_id` — it is the stable draft identity.
+    pub fn from_raw(raw: &[u8]) -> Option<ComposeMail> {
+        let m = crate::message::MailMessage::from_bytes(raw)?;
+        Some(ComposeMail {
+            from: m.from_addr.unwrap_or_default(),
+            to: m.to_addr.unwrap_or_default(),
+            cc: m.cc_addr.unwrap_or_default(),
+            bcc: String::new(),
+            subject: m.subject.unwrap_or_default(),
+            date: None,
+            message_id: m.message_id,
+            in_reply_to: m.in_reply_to,
+            references: if m.references.is_empty() {
+                None
+            } else {
+                Some(m.references.join(" "))
+            },
+            body_text: m.body_text.unwrap_or_default(),
+            headers: HashMap::new(),
+        })
+    }
+
+    /// Stable draft identity passed to `save_draft`/`delete_draft`.
+    pub fn draft_id(&self) -> String {
+        match &self.message_id {
+            Some(id) => id.clone(),
+            None => generate_message_id(&extract_email_from_from(&self.from)),
+        }
+    }
+
     /// Return the Date header value, generating it from the current
     /// time if `self.date` is `None`.
     fn date_header(&self) -> String {
@@ -634,6 +666,27 @@ mod tests {
         let ts = &parts[0][..dot_pos];
         assert_eq!(ts.len(), 14);
         assert!(ts.chars().all(|c| c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn from_raw_round_trip() {
+        let parent = make_parent();
+        let mail = ComposeMail::new_reply(&parent, "Bob", "bob@example.com");
+        let raw = mail.to_rfc2822();
+        let back = ComposeMail::from_raw(raw.as_bytes()).unwrap();
+        assert_eq!(back.subject, mail.subject);
+        assert_eq!(back.to, mail.to);
+        // The parser strips <> from Message-ID; the draft identity is bracket-insensitive.
+        assert!(back.message_id.is_some());
+        let stripped = mail.message_id.as_ref().unwrap().trim_matches(|c| c == '<' || c == '>');
+        assert_eq!(back.message_id.as_deref(), Some(stripped));
+    }
+
+    #[test]
+    fn draft_id_uses_message_id() {
+        let parent = make_parent();
+        let mail = ComposeMail::new_reply(&parent, "Bob", "bob@example.com");
+        assert_eq!(Some(mail.draft_id()), mail.message_id);
     }
 
     #[test]

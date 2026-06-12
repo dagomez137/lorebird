@@ -1,6 +1,7 @@
 pub mod compose;
 pub mod config_dir;
 pub mod indexer;
+pub mod maildir;
 pub mod message;
 pub mod query;
 pub mod schema;
