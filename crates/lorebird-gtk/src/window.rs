@@ -157,10 +157,14 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     main_vbox.append(&status_label);
     window.set_child(Some(&main_vbox));
 
+    // ── Track the active folder kind (for the Edit Draft action) ──
+    let active_folder_kind: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+
     // ── Wire sidebar selection → profile + view/search ──────
     let state_for_sidebar = state.clone();
     let status_for_sidebar = status_label.clone();
     let search_for_sidebar = search_entry.clone();
+    let active_folder_kind_sidebar = active_folder_kind.clone();
     let model = sidebar_model;
     sidebar_lb.connect_row_selected(move |_lb, row| {
         let Some(row) = row else { return };
@@ -177,6 +181,8 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
         if kind == "separator" || kind == "placeholder" {
             return;
         }
+
+        *active_folder_kind_sidebar.borrow_mut() = kind.to_string();
 
         let s = state_for_sidebar.borrow();
 
@@ -210,6 +216,15 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
                 } else {
                     status_for_sidebar
                         .set_text(&format!("No index for {} \u{2014} click Refresh", profile));
+                }
+                search_for_sidebar.set_text("");
+            }
+            "drafts" => {
+                s.select_profile(&profile);
+                match s.show_drafts() {
+                    Ok(n) => status_for_sidebar
+                        .set_text(&format!("Drafts: {} draft(s)", n)),
+                    Err(e) => status_for_sidebar.set_text(&format!("Error: {}", e)),
                 }
                 search_for_sidebar.set_text("");
             }
@@ -352,13 +367,22 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
 
     // ── Context menu (right-click on thread list) ─────────────────
     let context_menu = gtk4::Popover::new();
+    let menu_box = Box::new(Orientation::Vertical, 0);
     let reply_menu_btn = gtk4::Button::with_label("Reply");
     reply_menu_btn.add_css_class("flat");
     reply_menu_btn.set_margin_top(4);
     reply_menu_btn.set_margin_bottom(4);
     reply_menu_btn.set_margin_start(8);
     reply_menu_btn.set_margin_end(8);
-    context_menu.set_child(Some(&reply_menu_btn));
+    let edit_draft_btn = gtk4::Button::with_label("Edit Draft");
+    edit_draft_btn.add_css_class("flat");
+    edit_draft_btn.set_margin_top(4);
+    edit_draft_btn.set_margin_bottom(4);
+    edit_draft_btn.set_margin_start(8);
+    edit_draft_btn.set_margin_end(8);
+    menu_box.append(&reply_menu_btn);
+    menu_box.append(&edit_draft_btn);
+    context_menu.set_child(Some(&menu_box));
     // Must parent before popup(): an unparented GTK4 popover segfaults on popup().
     context_menu.set_parent(&column_view);
 
@@ -374,6 +398,24 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
             &selected_for_ctx,
             &app_for_ctx,
             &status_for_ctx,
+            is_dark,
+        );
+    });
+
+    let state_for_edit = state.clone();
+    let selected_for_edit = selected_node.clone();
+    let folder_kind_for_edit = active_folder_kind.clone();
+    let status_for_edit = status_label.clone();
+    let app_for_edit = app.clone();
+    let context_menu_for_edit = context_menu.clone();
+    edit_draft_btn.connect_clicked(move |_btn| {
+        context_menu_for_edit.popdown();
+        trigger_edit_draft(
+            &state_for_edit,
+            &selected_for_edit,
+            &folder_kind_for_edit,
+            &app_for_edit,
+            &status_for_edit,
             is_dark,
         );
     });
@@ -548,6 +590,72 @@ fn trigger_reply(
     }
 }
 
+// ── Edit Draft action ───────────────────────────────────────────────
+
+/// Reopen the selected draft in a compose window.
+fn trigger_edit_draft(
+    state: &Rc<RefCell<AppState>>,
+    selected_node: &Rc<RefCell<Option<ThreadNode>>>,
+    active_folder_kind: &Rc<RefCell<String>>,
+    app: &gtk4::Application,
+    status_label: &Label,
+    is_dark: bool,
+) {
+    if *active_folder_kind.borrow() != "drafts" {
+        status_label.set_text("Select a draft in the Drafts folder first");
+        return;
+    }
+
+    let node = match selected_node.borrow().as_ref() {
+        Some(n) => n.clone(),
+        None => {
+            status_label.set_text("No draft selected — select a draft first");
+            return;
+        }
+    };
+
+    let s = state.borrow();
+    let profile_label = s.active_profile.borrow().clone();
+    if profile_label.is_empty() {
+        status_label.set_text("No profile selected — select a profile first");
+        return;
+    }
+    let profile = match s.profiles.get(&profile_label) {
+        Some(p) => p.clone(),
+        None => {
+            status_label.set_text(&format!("Profile '{}' not found", profile_label));
+            return;
+        }
+    };
+
+    let filename = node.filename();
+    if filename.is_empty() {
+        status_label.set_text("Draft has no file on disk");
+        return;
+    }
+    let raw = match std::fs::read(profile.maildir.join(&filename)) {
+        Ok(r) => r,
+        Err(e) => {
+            status_label.set_text(&format!("Cannot read draft: {}", e));
+            return;
+        }
+    };
+    let mail = match lorebird_core::compose::ComposeMail::from_raw(&raw) {
+        Some(m) => m,
+        None => {
+            status_label.set_text("Cannot parse draft");
+            return;
+        }
+    };
+
+    let ctx = ComposeContext {
+        profile_label,
+        mail,
+        is_dark,
+    };
+    compose::open_compose_window(app, state, ctx);
+}
+
 // ── Sidebar ───────────────────────────────────────────────────────
 
 /// Build the sidebar from the loaded config.
@@ -570,6 +678,8 @@ fn build_sidebar(state: &AppState) -> (ScrolledWindow, ListStore, gtk4::ListBox)
         sidebar_model.append(&FolderItem::profile_header(label));
         // All Mail
         sidebar_model.append(&FolderItem::all_mail(label));
+        // Drafts
+        sidebar_model.append(&FolderItem::drafts(label));
         // Views
         for view in &profile.views {
             sidebar_model.append(&FolderItem::view(label, &view.label, &view.query));

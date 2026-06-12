@@ -74,6 +74,19 @@ impl FolderItem {
             .build()
     }
 
+    /// Create a "Drafts" row under a profile.
+    pub fn drafts(profile_label: &str) -> Self {
+        glib::Object::builder()
+            .property("name", "Drafts")
+            .property("icon-name", "document-edit-symbolic")
+            .property("count", 0u32)
+            .property("is-header", false)
+            .property("profile-label", profile_label)
+            .property("query", "")
+            .property("row-kind", "drafts")
+            .build()
+    }
+
     /// Create a saved view row under a profile.
     pub fn view(profile_label: &str, view_label: &str, query: &str) -> Self {
         glib::Object::builder()

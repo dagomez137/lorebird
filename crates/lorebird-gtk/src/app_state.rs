@@ -139,6 +139,51 @@ impl AppState {
         self.rebuild_thread_tree(conn, &maildir)
     }
 
+    /// List saved drafts for the active profile into the thread model.
+    pub fn show_drafts(&self) -> Result<usize, String> {
+        let maildir = self.active_maildir.borrow().clone();
+        if maildir.as_os_str().is_empty() {
+            return Err("no profile selected".to_string());
+        }
+        let drafts_dir = maildir.join("Drafts");
+
+        self.root_model.remove_all();
+        let mut count = 0;
+        for path in lorebird_core::maildir::list_drafts(&drafts_dir) {
+            let Ok(raw) = std::fs::read(&path) else {
+                continue;
+            };
+            let Some(m) = lorebird_core::message::MailMessage::from_bytes(&raw) else {
+                continue;
+            };
+
+            let subject = m.subject.unwrap_or_else(|| "(no subject)".to_string());
+            let from = m.from_addr.unwrap_or_default();
+            let to = m.to_addr.unwrap_or_default();
+            let cc = m.cc_addr.unwrap_or_default();
+            let message_id = m.message_id.unwrap_or_default();
+            let refs = m.references.join(" ");
+            let irt = m.in_reply_to.unwrap_or_default();
+            let date = m.date_rfc3339.unwrap_or_default();
+            let ts = m.received_ts;
+            let rel = format_relative_time(ts);
+            let rel_filename = path
+                .strip_prefix(&maildir)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .to_string();
+
+            let node = ThreadNode::new(
+                &subject, &from, &to, &cc, &rel, &rel, ts, ts, &message_id, &refs, &irt, &date,
+                &rel_filename,
+            );
+            node.set_body_preview(m.body_text.unwrap_or_default());
+            self.root_model.append(&node);
+            count += 1;
+        }
+        Ok(count)
+    }
+
     /// Open (or create) the index database for `maildir`.
     pub fn open_db(&self, maildir: &std::path::Path) -> Result<(), String> {
         let db_path = maildir.join(".lorebird.db");

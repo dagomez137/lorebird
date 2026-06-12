@@ -60,6 +60,9 @@ pub fn open_compose_window(app: &gtk4::Application, state: &Rc<RefCell<AppState>
     send_btn.add_css_class("suggested-action");
     send_btn.set_tooltip_text(Some("Send this message"));
 
+    let save_draft_btn = gtk4::Button::with_label("Save Draft");
+    save_draft_btn.set_tooltip_text(Some("Save this message as a draft"));
+
     let discard_btn = gtk4::Button::with_label("Discard");
     discard_btn.add_css_class("destructive-action");
     discard_btn.set_tooltip_text(Some("Discard this message"));
@@ -71,8 +74,10 @@ pub fn open_compose_window(app: &gtk4::Application, state: &Rc<RefCell<AppState>
     status_label.add_css_class("dim-label");
     status_label.add_css_class("caption");
 
-    header.pack_end(&send_btn);
+    // pack_end stacks right-to-left, so order reads Send | Save Draft | Discard.
     header.pack_end(&discard_btn);
+    header.pack_end(&save_draft_btn);
+    header.pack_end(&send_btn);
     header.pack_end(&spinner);
     window.set_titlebar(Some(&header));
 
@@ -138,6 +143,64 @@ pub fn open_compose_window(app: &gtk4::Application, state: &Rc<RefCell<AppState>
     vbox.append(&status_bar);
 
     window.set_child(Some(&vbox));
+
+    // ── Save Draft button handler ───────────────────────────────
+    // Clone the field widgets first; the Send closure moves its copies.
+    let save_from = from_entry.clone();
+    let save_to = to_entry.clone();
+    let save_cc = cc_entry.clone();
+    let save_bcc = bcc_entry.clone();
+    let save_subject = subject_entry.clone();
+    let save_buffer = body_buffer.clone();
+    let save_state = state.clone();
+    let save_profile = profile_label.clone();
+    let save_status = status_label.clone();
+    let save_mail = mail.clone();
+    save_draft_btn.connect_clicked(move |_btn| {
+        let body_start = save_buffer.start_iter();
+        let body_end = save_buffer.end_iter();
+        let body_text = save_buffer.text(&body_start, &body_end, false).to_string();
+
+        let final_mail = ComposeMail {
+            from: save_from.text().to_string(),
+            to: save_to.text().to_string(),
+            cc: save_cc.text().to_string(),
+            bcc: save_bcc.text().to_string(),
+            subject: save_subject.text().to_string(),
+            date: save_mail.date.clone(),
+            message_id: save_mail.message_id.clone(),
+            in_reply_to: save_mail.in_reply_to.clone(),
+            references: save_mail.references.clone(),
+            body_text,
+            headers: save_mail.headers.clone(),
+        };
+
+        let maildir = {
+            let s = save_state.borrow();
+            s.profiles.get(&save_profile).map(|p| p.maildir.clone())
+        };
+        let Some(maildir) = maildir else {
+            save_status.set_text("Cannot save draft: profile not found");
+            save_status.remove_css_class("dim-label");
+            save_status.add_css_class("error");
+            return;
+        };
+
+        let raw = final_mail.to_rfc2822();
+        let id = final_mail.draft_id();
+        match lorebird_core::maildir::save_draft(&maildir.join("Drafts"), &id, raw.as_bytes()) {
+            Ok(_) => {
+                save_status.set_text("Draft saved");
+                save_status.remove_css_class("error");
+                save_status.add_css_class("dim-label");
+            }
+            Err(e) => {
+                save_status.set_text(&format!("Draft save failed: {}", e));
+                save_status.remove_css_class("dim-label");
+                save_status.add_css_class("error");
+            }
+        }
+    });
 
     // ── Send button handler ─────────────────────────────────────
     let send_state = state.clone();

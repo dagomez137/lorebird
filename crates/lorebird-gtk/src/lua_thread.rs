@@ -407,10 +407,33 @@ fn handle_send(
         }
     };
 
+    // Per-profile Drafts/Sent maildirs for backup-before-send.
+    let dirs = state
+        .profiles
+        .get(profile_label)
+        .map(|p| (p.maildir.join("Drafts"), p.maildir.join("Sent")));
+    let raw = mail.to_rfc2822();
+    let draft_id = mail.draft_id();
+
+    // Autosave the draft BEFORE invoking the hook so it survives a failed send.
+    if let Some((ref drafts_dir, _)) = dirs
+        && let Err(e) = lorebird_core::maildir::save_draft(drafts_dir, &draft_id, raw.as_bytes())
+    {
+        eprintln!("[lorebird-lua]   warning: could not save draft: {}", e);
+    }
+
     eprintln!("[lorebird-lua]   calling on_send for '{}'...", profile_label);
     match state.vm.call_on_send(func, profile_label, mail, smtp) {
         Ok(true) => {
             eprintln!("[lorebird-lua]   on_send completed");
+            if let Some((ref drafts_dir, ref sent_dir)) = dirs {
+                if let Err(e) = lorebird_core::maildir::append_sent(sent_dir, raw.as_bytes()) {
+                    eprintln!("[lorebird-lua]   warning: could not save to Sent: {}", e);
+                }
+                if let Err(e) = lorebird_core::maildir::delete_draft(drafts_dir, &draft_id) {
+                    eprintln!("[lorebird-lua]   warning: could not delete draft: {}", e);
+                }
+            }
             LuaResult::SendDone { error: None }
         }
         Ok(false) => {
