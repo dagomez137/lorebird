@@ -906,7 +906,7 @@ config = {
         assert_eq!(result.cc, "added-by-hook@example.com");
         assert_eq!(
             result.to,
-            "list@example.com, Riccardo <riccardo@defmacro.it>"
+            "Alice <alice@example.com>, list@example.com, Riccardo <riccardo@defmacro.it>"
         ); // unchanged by hook
     }
 
