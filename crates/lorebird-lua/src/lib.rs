@@ -439,11 +439,12 @@ impl Vm {
         profile_label: &str,
         mail: &ComposeMail,
         smtp: Option<&SmtpConfig>,
-    ) -> LuaResult<()> {
+    ) -> LuaResult<bool> {
         self.set_smtp_global(smtp)?;
         let mail_table = build_mail_table(&self.lua, mail)?;
-        func.call::<()>((profile_label, mail_table))?;
-        Ok(())
+        // Lua-truthiness: nil/false → failed delivery, anything else → success.
+        let ok: bool = func.call((profile_label, mail_table))?;
+        Ok(ok)
     }
 
     /// Set or clear the `_lorebird_smtp` Lua global.
@@ -970,6 +971,7 @@ config = {{
     local fpath = write_tmpfile(mail_to_rfc2822(mail))
     -- Copy to a known location for the test to check
     sh({{"cp", fpath, "{}"}})
+    return true
   end,
 }}
 "#,
@@ -993,7 +995,8 @@ config = {{
         };
 
         // The on_send should succeed without error
-        vm.call_on_send(on_send, "test", &mail, None).unwrap();
+        let ok = vm.call_on_send(on_send, "test", &mail, None).unwrap();
+        assert!(ok);
 
         // Verify the file was written
         if let Ok(content) = std::fs::read_to_string(&tmp) {
@@ -1002,6 +1005,41 @@ config = {{
             assert!(content.contains("Hello from send"));
             std::fs::remove_file(&tmp).ok();
         }
+    }
+
+    #[test]
+    fn call_on_send_returns_false_on_failed_delivery() {
+        let vm = Vm::new().unwrap();
+        let code = r#"
+config = {
+  profiles = {
+    ["test"] = {
+      maildir = "/tmp/test-mail",
+      on_fetch = function(label, maildir) return true end,
+    },
+  },
+  on_send = function(profile, mail) return false end,
+}
+"#;
+        let loaded = vm.load_config_string(code).unwrap();
+        let on_send = loaded.global_hooks.on_send.as_ref().unwrap();
+
+        let mail = lorebird_core::compose::ComposeMail {
+            from: "Alice <alice@example.com>".to_string(),
+            to: "Bob <bob@example.com>".to_string(),
+            cc: String::new(),
+            bcc: String::new(),
+            subject: "Test send".to_string(),
+            date: None,
+            message_id: None,
+            in_reply_to: None,
+            references: None,
+            body_text: "body\n".to_string(),
+            headers: std::collections::HashMap::new(),
+        };
+
+        let ok = vm.call_on_send(on_send, "test", &mail, None).unwrap();
+        assert!(!ok);
     }
 
     #[test]

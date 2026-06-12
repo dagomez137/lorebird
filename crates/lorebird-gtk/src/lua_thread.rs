@@ -409,9 +409,15 @@ fn handle_send(
 
     eprintln!("[lorebird-lua]   calling on_send for '{}'...", profile_label);
     match state.vm.call_on_send(func, profile_label, mail, smtp) {
-        Ok(()) => {
+        Ok(true) => {
             eprintln!("[lorebird-lua]   on_send completed");
             LuaResult::SendDone { error: None }
+        }
+        Ok(false) => {
+            eprintln!("[lorebird-lua]   on_send hook returned false — delivery failed");
+            LuaResult::SendDone {
+                error: Some("on_send hook returned false — delivery failed".to_string()),
+            }
         }
         Err(e) => {
             eprintln!("[lorebird-lua]   on_send error: {}", e);
