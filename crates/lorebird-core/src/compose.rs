@@ -65,24 +65,18 @@ pub struct ParentMail {
 // ── Reply construction ────────────────────────────────────────────────
 
 impl ComposeMail {
-    /// Build a pre-filled reply from a parent message and profile.
+    /// Build a pre-filled reply-all from a parent message and profile.
     ///
-    /// Reply-All (mailing-list style):
-    /// - `to`  = parent's `to` addresses + self (added if not already present)
-    /// - `cc`  = parent's `cc` addresses minus self
-    /// - `subject` = "Re: " prefix (no double Re:)
-    /// - `in_reply_to` = parent's `message_id`
-    /// - `references` = parent's references + " " + parent's `message_id`
-    /// - `from` = "Profile Name <profile@email>"
-    /// - `date` = `None` (auto-generated at send time)
-    /// - `message_id` = freshly generated unique ID
-    /// - `body_text` = quoted parent body with attribution line
+    /// To = author + original recipients + self; Cc = parent Cc minus self
+    /// and minus anyone already in To, deduplicated by email so no recipient
+    /// lands in both To and Cc.
     pub fn new_reply(parent: &ParentMail, profile_name: &str, profile_email: &str) -> Self {
         let from = format!("{} <{}>", profile_name, profile_email);
-        let to = add_self_to_addrs(&parent.to, profile_name, profile_email);
-        let cc = remove_self_from_addrs(&parent.cc, profile_email);
+        let to_base = merge_addr_lists(&parent.from, &parent.to);
+        let to = add_self_to_addrs(&to_base, profile_name, profile_email);
+        let cc = remove_addrs_from_cc(&parent.cc, &to, profile_email);
 
-        // Subject: prepend "Re: " unless it already starts with it (case-insensitive).
+        // Prepend "Re: " unless already present (case-insensitive).
         let subject = if parent.subject.to_lowercase().starts_with("re:") {
             parent.subject.clone()
         } else {
@@ -91,7 +85,6 @@ impl ComposeMail {
 
         let in_reply_to = parent.message_id.clone();
 
-        // References chain: parent's references + parent's message_id.
         let mut refs_parts = Vec::new();
         if !parent.references.is_empty() {
             refs_parts.push(parent.references.clone());
@@ -292,20 +285,44 @@ fn add_self_to_addrs(addrs: &str, name: &str, email: &str) -> String {
     }
 }
 
-/// Remove our own address from a comma-separated RFC 2822 address list.
-///
-/// Splits on `", "`, removes any entry containing our email (matching
-/// both `alice@example.com` and `Alice <alice@example.com>`), and
-/// re-joins with `", "`.
-fn remove_self_from_addrs(addrs: &str, email: &str) -> String {
-    if addrs.is_empty() || !addr_list_contains(addrs, email) {
-        return addrs.to_string();
+/// Concatenate two comma-separated address lists (`a` then `b`), dropping
+/// duplicates matched case-insensitively by bare email.
+fn merge_addr_lists(a: &str, b: &str) -> String {
+    let mut seen: Vec<String> = Vec::new();
+    let mut out: Vec<String> = Vec::new();
+    for entry in a.split(", ").chain(b.split(", ")) {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let email = extract_email_from_from(entry).to_lowercase();
+        if seen.iter().any(|e| *e == email) {
+            continue;
+        }
+        seen.push(email);
+        out.push(entry.to_string());
     }
-    let filtered: Vec<&str> = addrs
+    out.join(", ")
+}
+
+/// Drop our own address and anyone already in `to` (matched by bare email)
+/// from `cc`, so no recipient appears in both To and Cc.
+fn remove_addrs_from_cc(cc: &str, to: &str, self_email: &str) -> String {
+    if cc.is_empty() {
+        return String::new();
+    }
+    let self_l = self_email.to_lowercase();
+    let to_emails: Vec<String> = to
         .split(", ")
-        .filter(|entry| !entry.contains(email))
+        .map(|e| extract_email_from_from(e).to_lowercase())
         .collect();
-    filtered.join(", ")
+    cc.split(", ")
+        .filter(|entry| {
+            let email = extract_email_from_from(entry).to_lowercase();
+            email != self_l && !to_emails.iter().any(|t| *t == email)
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Check whether a comma-separated RFC 2822 address list contains the
@@ -346,16 +363,16 @@ mod tests {
         let mail = ComposeMail::new_reply(&parent, "Riccardo", "riccardo@defmacro.it");
 
         assert_eq!(mail.from, "Riccardo <riccardo@defmacro.it>");
-        // To = parent.to + self (self not in parent.to)
-        assert_eq!(mail.to, "list@example.com, Riccardo <riccardo@defmacro.it>");
-        // Cc copied from parent, self not in parent.cc so unchanged
+        assert_eq!(
+            mail.to,
+            "Alice <alice@example.com>, list@example.com, Riccardo <riccardo@defmacro.it>"
+        );
         assert_eq!(mail.cc, "bob@example.com, carol@example.com");
         assert_eq!(mail.bcc, "");
         assert_eq!(mail.subject, "Re: [PATCH v2] Fix memory leak");
-        assert!(mail.date.is_none()); // generated at send time
-        assert!(mail.message_id.is_some()); // freshly generated
+        assert!(mail.date.is_none());
+        assert!(mail.message_id.is_some());
         assert!(mail.message_id.as_ref().unwrap().starts_with("<"));
-        // Message-ID uses sender domain: riccardo@defmacro.it → @defmacro.it
         assert!(mail.message_id.as_ref().unwrap().ends_with("@defmacro.it>"));
         assert_eq!(mail.in_reply_to, Some("<abc@def>".to_string()));
         assert_eq!(
@@ -373,8 +390,11 @@ mod tests {
             ..make_parent()
         };
         let mail = ComposeMail::new_reply(&parent, "Riccardo", "riccardo@defmacro.it");
-        // Self already present — To unchanged
-        assert_eq!(mail.to, "list@example.com, riccardo@defmacro.it");
+        // Self already in To is not re-added.
+        assert_eq!(
+            mail.to,
+            "Alice <alice@example.com>, list@example.com, riccardo@defmacro.it"
+        );
     }
 
     #[test]
@@ -406,7 +426,10 @@ mod tests {
             ..make_parent()
         };
         let mail = ComposeMail::new_reply(&parent, "Riccardo", "riccardo@defmacro.it");
-        assert_eq!(mail.to, "Riccardo <riccardo@defmacro.it>");
+        assert_eq!(
+            mail.to,
+            "Alice <alice@example.com>, Riccardo <riccardo@defmacro.it>"
+        );
     }
 
     #[test]
@@ -417,6 +440,42 @@ mod tests {
         };
         let mail = ComposeMail::new_reply(&parent, "Riccardo", "riccardo@defmacro.it");
         assert_eq!(mail.cc, "");
+    }
+
+    #[test]
+    fn new_reply_includes_author_when_only_in_from() {
+        // Regression: author (parent.from) must appear in To even when
+        // they are not among the original To recipients.
+        let parent = ParentMail {
+            from: "Alice <alice@example.com>".to_string(),
+            to: "Dave <dave@example.com>".to_string(),
+            cc: "list@example.com".to_string(),
+            ..make_parent()
+        };
+        let mail = ComposeMail::new_reply(&parent, "Riccardo", "riccardo@defmacro.it");
+        assert_eq!(
+            mail.to,
+            "Alice <alice@example.com>, Dave <dave@example.com>, Riccardo <riccardo@defmacro.it>"
+        );
+        assert_eq!(mail.cc, "list@example.com");
+    }
+
+    #[test]
+    fn new_reply_author_in_cc_is_deduped_to_to() {
+        // Author in both From and Cc must end up in To only, never both.
+        let parent = ParentMail {
+            from: "Alice <alice@example.com>".to_string(),
+            to: "list@example.com".to_string(),
+            cc: "Alice <alice@example.com>, bob@example.com".to_string(),
+            ..make_parent()
+        };
+        let mail = ComposeMail::new_reply(&parent, "Bob", "bob2@example.com");
+        assert_eq!(
+            mail.to,
+            "Alice <alice@example.com>, list@example.com, Bob <bob2@example.com>"
+        );
+        // Alice dropped from Cc because she moved to To.
+        assert_eq!(mail.cc, "bob@example.com");
     }
 
     #[test]
