@@ -359,6 +359,8 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     reply_menu_btn.set_margin_start(8);
     reply_menu_btn.set_margin_end(8);
     context_menu.set_child(Some(&reply_menu_btn));
+    // Must parent before popup(): an unparented GTK4 popover segfaults on popup().
+    context_menu.set_parent(&column_view);
 
     let state_for_ctx = state.clone();
     let selected_for_ctx = selected_node.clone();
