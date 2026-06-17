@@ -76,6 +76,9 @@ pub enum LoreError {
 
     #[error("Read timeout: no data received for {0}s")]
     ReadTimeout(u64),
+
+    #[error("No results found")]
+    NoResults,
 }
 
 // ── Result type ──────────────────────────────────────────────────────
@@ -326,6 +329,21 @@ fn parse_date_string(s: &str) -> Option<String> {
     }
 }
 
+/// Byte offset of `prefix` where it begins a query token (start of string or
+/// after a space or `(`), so e.g. `rt:` doesn't match inside `s:support:`.
+fn find_prefix(query: &str, prefix: &str) -> Option<usize> {
+    let bytes = query.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = query[from..].find(prefix) {
+        let idx = from + rel;
+        if idx == 0 || matches!(bytes[idx - 1], b' ' | b'(') {
+            return Some(idx);
+        }
+        from = idx + prefix.len();
+    }
+    None
+}
+
 fn build_incremental_query(query: &str, last_date: &str) -> String {
     let ymd: Vec<&str> = last_date.split('-').collect();
     if ymd.len() != 3 { return query.to_string(); }
@@ -334,19 +352,23 @@ fn build_incremental_query(query: &str, last_date: &str) -> String {
     };
     if year == 0 || month == 0 || day == 0 { return query.to_string(); }
     let (y, m, d) = subtract_one_day(year, month, day);
-    let dt_lower = format!("{:04}{:02}{:02}", y, m, d);
-    if let Some(dt_start) = query.find("dt:") {
-        let after_dt = &query[dt_start..];
-        let dt_end = after_dt.find(' ').map(|i| dt_start + i).unwrap_or(query.len());
-        let dt_clause = &query[dt_start..dt_end];
-        if let Some(dotdot) = dt_clause.find("..") {
-            format!("{}dt:{}{}{}",
-                &query[..dt_start], dt_lower, &dt_clause[dotdot..], &query[dt_end..])
+    let rt_lower = format!("{:04}{:02}{:02}", y, m, d);
+    // Bound by received time (`rt:`), not sent Date (`dt:`/`d:`): a message can
+    // arrive at lore well after the date in its own header, so a `dt:` cutoff
+    // silently skips late-arriving mail. Any existing `rt:` clause is rewritten
+    // to start at our incremental cutoff, keeping its upper bound if present.
+    if let Some(rt_start) = find_prefix(query, "rt:") {
+        let after_rt = &query[rt_start..];
+        let rt_end = after_rt.find(' ').map(|i| rt_start + i).unwrap_or(query.len());
+        let rt_clause = &query[rt_start..rt_end];
+        if let Some(dotdot) = rt_clause.find("..") {
+            format!("{}rt:{}{}{}",
+                &query[..rt_start], rt_lower, &rt_clause[dotdot..], &query[rt_end..])
         } else {
-            format!("{}dt:{}..{}", &query[..dt_start], dt_lower, &query[dt_end..])
+            format!("{}rt:{}..{}", &query[..rt_start], rt_lower, &query[rt_end..])
         }
     } else {
-        format!("{} dt:{}..", query.trim_end(), dt_lower)
+        format!("{} rt:{}..", query.trim_end(), rt_lower)
     }
 }
 
@@ -402,6 +424,10 @@ impl LoreClient {
         use ureq::config::Config;
         Config::builder()
             .timeout_recv_body(Some(Duration::from_secs(READ_TIMEOUT_SECS)))
+            // public-inbox answers a zero-result mbox download with HTTP 404;
+            // we want to inspect the status ourselves rather than have ureq
+            // turn every non-2xx into a transport error.
+            .http_status_as_error(false)
             .build()
             .into()
     }
@@ -433,14 +459,25 @@ impl LoreClient {
             .header("Priority", "u=0, i")
             .send_form([("x", "full threads")])
             .map_err(|e| LoreError::Http(format!("POST request failed: {}", e)))?;
-        if response.status() != 200 {
-            return Err(LoreError::Http(format!("request returned status {}", response.status())));
-        }
-        response.into_body().with_config().limit(300 * 1024 * 1024).read_to_vec()
+        let status = response.status();
+        let body = response.into_body().with_config().limit(300 * 1024 * 1024).read_to_vec()
             .map_err(|e| match &e {
                 ureq::Error::Timeout(_) => LoreError::ReadTimeout(READ_TIMEOUT_SECS),
                 _ => LoreError::Http(format!("reading response: {}", e)),
-            })
+            })?;
+        // public-inbox answers a search with zero matches as 404 "No results
+        // found" — a normal "caught up" outcome. Other 404s (e.g. a mistyped
+        // list path) are genuine errors, so distinguish them by body.
+        if status == 404 {
+            if String::from_utf8_lossy(&body).contains("No results found") {
+                return Err(LoreError::NoResults);
+            }
+            return Err(LoreError::Http(format!("request returned status {}", status)));
+        }
+        if status != 200 {
+            return Err(LoreError::Http(format!("request returned status {}", status)));
+        }
+        Ok(body)
     }
 
     /// Detect content type from the first bytes of the response.
@@ -501,13 +538,19 @@ impl LoreClient {
 
         let pass_url = format!("{}/.within.website/x/cmd/anubis/api/pass-challenge?response={}&nonce={}&redir={}&elapsedTime=5000",
             self.base_url, urlencoding(&hash_hex), nonce, urlencoding(search_url));
-        agent.get(&pass_url)
+        let pass_resp = agent.get(&pass_url)
             .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
             .header("User-Agent", USER_AGENT)
             .header("Referer", search_url)
             .header("Upgrade-Insecure-Requests", "1")
             .call()
             .map_err(|e| LoreError::Anubis(format!("submitting solution: {}", e)))?;
+        // With `http_status_as_error(false)` a rejected solution no longer
+        // raises an error on its own, so check it explicitly.
+        if pass_resp.status().as_u16() >= 400 {
+            return Err(LoreError::Anubis(format!(
+                "challenge submission returned status {}", pass_resp.status())));
+        }
 
         if self.verbose { eprintln!("[lorefetch] Retry after challenge..."); }
         self.post_raw(agent, search_url)
@@ -615,7 +658,14 @@ pub fn fetch_to_maildir(
 
     // 4. Fetch response bytes (handles Anubis if needed)
     let client = LoreClient::new().verbose(verbose);
-    let bytes = client.fetch_response_bytes(&effective_query, list)?;
+    let bytes = match client.fetch_response_bytes(&effective_query, list) {
+        Ok(b) => b,
+        Err(LoreError::NoResults) => {
+            if verbose { eprintln!("[lorefetch] No new results — caught up"); }
+            return Ok(FetchResult { new_messages: 0, total_messages: 0, timed_out: false });
+        }
+        Err(e) => return Err(e),
+    };
 
     // 6. Create streaming reader and process messages
     let reader = make_reader(bytes)?;
@@ -850,13 +900,20 @@ mod tests {
 
     #[test]
     fn incremental_with_last_date() {
-        assert_eq!(build_incremental_query("s:linux-kernel", "2025-06-08"), "s:linux-kernel dt:20250607..");
+        assert_eq!(build_incremental_query("s:linux-kernel", "2025-06-08"), "s:linux-kernel rt:20250607..");
     }
 
     #[test]
-    fn incremental_existing_dt() {
-        assert_eq!(build_incremental_query("s:lk dt:20240101..1.month.ago", "2025-03-15"),
-            "s:lk dt:20250314..1.month.ago");
+    fn incremental_existing_rt() {
+        assert_eq!(build_incremental_query("s:lk rt:20240101..1.month.ago", "2025-03-15"),
+            "s:lk rt:20250314..1.month.ago");
+    }
+
+    #[test]
+    fn incremental_rt_not_substring() {
+        // "rt:" inside "support:" must not be mistaken for an rt: clause.
+        assert_eq!(build_incremental_query("s:support:foo", "2025-03-15"),
+            "s:support:foo rt:20250314..");
     }
 
     #[test]
