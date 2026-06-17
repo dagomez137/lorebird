@@ -21,7 +21,7 @@ use gtk4::{
 use sourceview5 as sv;
 use sourceview5::prelude::*;
 
-use crate::app_state::AppState;
+use crate::app_state::{AppState, PendingDesc};
 use crate::compose::{self, ComposeContext};
 use crate::folder_item::{FolderItem, FolderKind};
 use crate::lua_thread::LuaCommand;
@@ -84,45 +84,6 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     status_label.set_margin_bottom(4);
     status_label.add_css_class("dim-label");
     status_label.add_css_class("caption");
-
-    // ── Wire Refresh button (async via Lua thread) ───────────────
-    let state_for_refresh = state.clone();
-    let status_for_refresh = status_label.clone();
-    let spinner_for_refresh = spinner.clone();
-    let refresh_btn_ref = refresh_btn.clone();
-    refresh_btn.connect_clicked(move |_btn| {
-        refresh_btn_ref.set_sensitive(false);
-        let s = state_for_refresh.borrow();
-        match s.request_fetch() {
-            Ok(()) => {
-                spinner_for_refresh.set_spinning(true);
-                status_for_refresh.set_text("Refreshing\u{2026}");
-                let state_poll = state_for_refresh.clone();
-                let status_poll = status_for_refresh.clone();
-                let spinner_poll = spinner_for_refresh.clone();
-                let btn_poll = refresh_btn_ref.clone();
-                glib::timeout_add_local(Duration::from_millis(100), move || {
-                    let s = state_poll.borrow();
-                    match s.poll_fetch_result() {
-                        Some(result) => {
-                            spinner_poll.set_spinning(false);
-                            btn_poll.set_sensitive(true);
-                            match s.handle_fetch_result(&result) {
-                                Ok(msg) => status_poll.set_text(&msg),
-                                Err(e) => status_poll.set_text(&format!("Refresh error: {}", e)),
-                            }
-                            glib::ControlFlow::Break
-                        }
-                        None => glib::ControlFlow::Continue,
-                    }
-                });
-            }
-            Err(e) => {
-                refresh_btn_ref.set_sensitive(true);
-                status_for_refresh.set_text(&format!("Refresh error: {}", e));
-            }
-        }
-    });
 
     header.pack_end(&refresh_btn);
     header.pack_end(&reply_btn);
@@ -188,6 +149,83 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     delete_draft_btn.set_margin_start(8);
     delete_draft_btn.set_margin_end(8);
 
+    // ── Wire Refresh button (async via Lua thread) ───────────────
+    let state_for_refresh = state.clone();
+    let status_for_refresh = status_label.clone();
+    let spinner_for_refresh = spinner.clone();
+    let refresh_btn_ref = refresh_btn.clone();
+    refresh_btn.connect_clicked(move |_btn| {
+        refresh_btn_ref.set_sensitive(false);
+        let s = state_for_refresh.borrow();
+        match s.request_fetch() {
+            Ok(()) => {
+                spinner_for_refresh.set_spinning(true);
+                status_for_refresh.set_text("Refreshing\u{2026}");
+                let state_poll = state_for_refresh.clone();
+                let status_poll = status_for_refresh.clone();
+                let spinner_poll = spinner_for_refresh.clone();
+                let btn_poll = refresh_btn_ref.clone();
+                glib::timeout_add_local(Duration::from_millis(100), move || {
+                    let s = state_poll.borrow();
+                    match s.poll_fetch_result() {
+                        Some(result) => {
+                            btn_poll.set_sensitive(true);
+                            match s.handle_fetch_result(&result) {
+                                Ok(()) => {
+                                    // The list rebuild was dispatched to the
+                                    // query worker; the persistent query poller
+                                    // stops the spinner and sets the final
+                                    // status (and scrolls to the top).
+                                    status_poll.set_text("Indexing\u{2026}");
+                                }
+                                Err(e) => {
+                                    spinner_poll.set_spinning(false);
+                                    status_poll.set_text(&format!("Refresh error: {}", e));
+                                }
+                            }
+                            glib::ControlFlow::Break
+                        }
+                        None => glib::ControlFlow::Continue,
+                    }
+                });
+            }
+            Err(e) => {
+                refresh_btn_ref.set_sensitive(true);
+                status_for_refresh.set_text(&format!("Refresh error: {}", e));
+            }
+        }
+    });
+
+    // ── Persistent query poller ──────────────────────────────────
+    // The background query worker (profile switches, views, search,
+    // post-fetch rebuilds) delivers `PlainNode` trees here.  This single
+    // poller applies current results to the list, discards stale ones,
+    // updates the status bar, stops the spinner, and scrolls to the top.
+    let state_for_qpoll = state.clone();
+    let status_for_qpoll = status_label.clone();
+    let spinner_for_qpoll = spinner.clone();
+    let column_view_for_qpoll = column_view.clone();
+    glib::timeout_add_local(Duration::from_millis(50), move || {
+        let s = state_for_qpoll.borrow();
+        let mut applied_current = false;
+        while let Some(result) = s.poll_query_result() {
+            if let Some(status) = s.apply_query_result(&result) {
+                status_for_qpoll.set_text(&status);
+                applied_current = true;
+            }
+        }
+        if applied_current {
+            spinner_for_qpoll.set_spinning(false);
+            let cv = column_view_for_qpoll.clone();
+            glib::idle_add_local_once(move || {
+                if let Some(adj) = cv.vadjustment() {
+                    adj.set_value(adj.lower());
+                }
+            });
+        }
+        glib::ControlFlow::Continue
+    });
+
     // ── Wire sidebar selection → profile + view/search ──────
     let state_for_sidebar = state.clone();
     let status_for_sidebar = status_label.clone();
@@ -195,6 +233,8 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     let active_folder_kind_sidebar = active_folder_kind.clone();
     let selected_node_sidebar = selected_node.clone();
     let reply_btn_sidebar = reply_btn.clone();
+    let column_view_for_sidebar = column_view.clone();
+    let spinner_for_sidebar = spinner.clone();
     let model = sidebar_model;
     sidebar_lb.connect_row_selected(move |_lb, row| {
         let Some(row) = row else { return };
@@ -241,11 +281,13 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
                     }
                 }
                 if s.db.borrow().is_some() {
-                    match s.show_all() {
-                        Ok(()) => {
-                            status_for_sidebar.set_text(&format!("All mail for: {}", profile))
-                        }
-                        Err(e) => status_for_sidebar.set_text(&format!("Error: {}", e)),
+                    spinner_for_sidebar.set_spinning(true);
+                    status_for_sidebar.set_text("Loading\u{2026}");
+                    if let Err(e) = s.request_load_all(PendingDesc::AllMail {
+                        profile: profile.to_string(),
+                    }) {
+                        spinner_for_sidebar.set_spinning(false);
+                        status_for_sidebar.set_text(&format!("Error: {}", e));
                     }
                 } else {
                     status_for_sidebar
@@ -281,27 +323,61 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
                 // Run the view's query
                 s.select_view(query.to_string());
                 search_for_sidebar.set_text(&query);
-                match s.search(&query) {
-                    Ok(n) => status_for_sidebar.set_text(&format!(
-                        "View \u{2018}{}\u{2019} in: {} \u{2014} {} match(es)",
-                        item.name(),
-                        profile,
-                        n
-                    )),
-                    Err(e) => status_for_sidebar.set_text(&format!("Search error: {}", e)),
+                spinner_for_sidebar.set_spinning(true);
+                status_for_sidebar.set_text("Searching\u{2026}");
+                if let Err(e) = s.request_search(
+                    query.to_string(),
+                    PendingDesc::View {
+                        name: item.name().to_string(),
+                        profile: profile.to_string(),
+                    },
+                ) {
+                    spinner_for_sidebar.set_spinning(false);
+                    status_for_sidebar.set_text(&format!("Search error: {}", e));
                 }
             }
             _ => {}
+        }
+
+        // Drafts repopulate synchronously here, so scroll to the top
+        // directly.  All-mail and views are repopulated asynchronously by
+        // the query worker; that path scrolls to the top in the poller.
+        if kind.as_str() == "drafts" {
+            let cv = column_view_for_sidebar.clone();
+            glib::idle_add_local_once(move || {
+                if let Some(adj) = cv.vadjustment() {
+                    adj.set_value(adj.lower());
+                }
+            });
         }
     });
 
     // ── Wire selection → preview ──────────────────────────────
     let pl = preview_labels;
+    let state_for_preview = state.clone();
     selection.connect_selection_changed(move |sel, _pos, _n| {
         if let Some(obj) = sel.selected_item()
             && let Some(row) = obj.downcast_ref::<TreeListRow>()
             && let Some(node) = row.item().and_downcast::<ThreadNode>()
         {
+            // Lazily read the rich fields (To/Cc/body/In-Reply-To) from disk
+            // the first time a message is previewed, then cache them on the
+            // node so re-selection is instant.  The thread list itself is
+            // built from the index alone, with no per-message disk reads.
+            if node.body_preview().is_empty() && !node.filename().is_empty() {
+                let maildir = state_for_preview.borrow().active_maildir.borrow().clone();
+                if let Some(m) =
+                    lorebird_core::store::read_raw_message(&maildir, &node.filename())
+                {
+                    node.set_to_addrs(m.to_addr.unwrap_or_default());
+                    node.set_cc_addrs(m.cc_addr.unwrap_or_default());
+                    node.set_in_reply_to(m.in_reply_to.unwrap_or_default());
+                    if let Some(b) = m.body_text {
+                        node.set_body_preview(b);
+                    }
+                }
+            }
+
             pl.from_label.set_text(&node.sender());
             let to_full = node.to_addrs();
             pl.to_label.set_text(&truncate_addr(&to_full));
@@ -361,46 +437,36 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     // Enter / activate → run search query
     let state_for_search = state.clone();
     let status_for_search = status_label.clone();
+    let spinner_for_search = spinner.clone();
     search_entry.connect_activate(move |entry| {
         let query = entry.text().to_string();
-        if query.is_empty() {
-            // Empty query → show all
-            let s = state_for_search.borrow();
-            match s.show_all() {
-                Ok(()) => {
-                    status_for_search.set_text("Showing all threads");
-                }
-                Err(e) => {
-                    status_for_search.set_text(&format!("Error: {}", e));
-                }
-            }
+        let s = state_for_search.borrow();
+        spinner_for_search.set_spinning(true);
+        let dispatch = if query.is_empty() {
+            status_for_search.set_text("Loading\u{2026}");
+            s.request_load_all(PendingDesc::ShowAll)
         } else {
-            let s = state_for_search.borrow();
-            match s.search(&query) {
-                Ok(n) => {
-                    status_for_search
-                        .set_text(&format!("Found {} matching message(s) in thread(s)", n));
-                }
-                Err(e) => {
-                    status_for_search.set_text(&format!("Search error: {}", e));
-                }
-            }
+            status_for_search.set_text("Searching\u{2026}");
+            s.request_search(query, PendingDesc::Search)
+        };
+        if let Err(e) = dispatch {
+            spinner_for_search.set_spinning(false);
+            status_for_search.set_text(&format!("Search error: {}", e));
         }
     });
 
     // Escape / stop-search → clear search, show all
     let state_for_clear = state.clone();
     let status_for_clear = status_label.clone();
+    let spinner_for_clear = spinner.clone();
     search_entry.connect_stop_search(move |entry| {
         entry.set_text("");
         let s = state_for_clear.borrow();
-        match s.show_all() {
-            Ok(()) => {
-                status_for_clear.set_text("Showing all threads");
-            }
-            Err(e) => {
-                status_for_clear.set_text(&format!("Error: {}", e));
-            }
+        spinner_for_clear.set_spinning(true);
+        status_for_clear.set_text("Loading\u{2026}");
+        if let Err(e) = s.request_load_all(PendingDesc::ShowAll) {
+            spinner_for_clear.set_spinning(false);
+            status_for_clear.set_text(&format!("Error: {}", e));
         }
     });
 
