@@ -5,7 +5,7 @@
 //! list-store of `ThreadNode`s, and a handle to the background Lua
 //! thread.  See `specs/threading.md` for the full architecture.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -13,10 +13,20 @@ use gio::ListStore;
 use rusqlite::Connection;
 
 use crate::lua_thread::{InitResult, LuaCommand, LuaResult, LuaThread};
+use crate::query_thread::{PlainNode, QueryCommand, QueryResult, QueryThread};
 use crate::thread_node::ThreadNode;
-use lorebird_core::store::DbMessage;
-use lorebird_core::thread::{self, Thread};
 use lorebird_lua::ResolvedProfile;
+
+/// Describes an in-flight query request so the poller can produce the
+/// right status text once the result arrives.
+#[derive(Clone)]
+pub enum PendingDesc {
+    AllMail { profile: String },
+    View { name: String, profile: String },
+    Search,
+    ShowAll,
+    Fetch { indexed_count: usize },
+}
 
 /// Central application state, shared between the window and action callbacks.
 pub struct AppState {
@@ -40,6 +50,16 @@ pub struct AppState {
 
     /// Handle to the background Lua thread (owns Vm + LoadedConfig).
     pub lua_thread: LuaThread,
+
+    /// Handle to the background query thread (owns a read-only DB connection).
+    pub query_thread: QueryThread,
+
+    /// Monotonic generation counter for query requests.  Results whose
+    /// generation differs from this are stale and discarded.
+    query_generation: Cell<u64>,
+
+    /// Describes the most recently dispatched query (for status text).
+    pending_desc: RefCell<Option<PendingDesc>>,
 
     /// Resolved profiles (keyed by label), snapshot from config.
     pub profiles: HashMap<String, ResolvedProfile>,
@@ -86,6 +106,9 @@ impl AppState {
             active_maildir: RefCell::new(PathBuf::new()),
             active_query: RefCell::new(None),
             lua_thread,
+            query_thread: QueryThread::spawn(),
+            query_generation: Cell::new(0),
+            pending_desc: RefCell::new(None),
             profiles: init.profiles,
             has_on_reply: init.has_on_reply,
             has_on_send: init.has_on_send,
@@ -113,30 +136,67 @@ impl AppState {
         *self.active_query.borrow_mut() = Some(query);
     }
 
-    /// Run a search query and rebuild the thread tree.
-    pub fn search(&self, query: &str) -> Result<usize, String> {
-        let maildir = self.active_maildir.borrow().clone();
-        if maildir.as_os_str().is_empty() {
-            return Err("no profile selected".to_string());
-        }
-        if self.db.borrow().is_none() {
-            return Err("no database open — click Index first".to_string());
-        }
-        self.rebuild_thread_tree_searched(&maildir, query)
+    /// Bump and return the current query generation.
+    fn bump_generation(&self) -> u64 {
+        let g = self.query_generation.get().wrapping_add(1);
+        self.query_generation.set(g);
+        g
     }
 
-    /// Clear search results and show all messages.
-    pub fn show_all(&self) -> Result<(), String> {
+    /// Dispatch a "load all messages" request to the query worker.
+    /// Returns immediately; the result is delivered via `poll_query_result`.
+    pub fn request_load_all(&self, desc: PendingDesc) -> Result<(), String> {
         let maildir = self.active_maildir.borrow().clone();
         if maildir.as_os_str().is_empty() {
             return Err("no profile selected".to_string());
         }
-        if self.db.borrow().is_none() {
-            return Err("no database open — click Index first".to_string());
+        let generation = self.bump_generation();
+        *self.pending_desc.borrow_mut() = Some(desc);
+        self.query_thread
+            .send(QueryCommand::LoadAll { generation, maildir })
+    }
+
+    /// Dispatch a search request to the query worker.
+    /// Returns immediately; the result is delivered via `poll_query_result`.
+    pub fn request_search(&self, query: String, desc: PendingDesc) -> Result<(), String> {
+        let maildir = self.active_maildir.borrow().clone();
+        if maildir.as_os_str().is_empty() {
+            return Err("no profile selected".to_string());
         }
-        let db = self.db.borrow();
-        let conn = db.as_ref().ok_or("database not open")?;
-        self.rebuild_thread_tree(conn, &maildir)
+        let generation = self.bump_generation();
+        *self.pending_desc.borrow_mut() = Some(desc);
+        self.query_thread.send(QueryCommand::Search {
+            generation,
+            maildir,
+            query,
+        })
+    }
+
+    /// Poll the query worker for a completed result (non-blocking).
+    pub fn poll_query_result(&self) -> Option<QueryResult> {
+        self.query_thread.try_recv()
+    }
+
+    /// Apply a query result on the main thread.  Stale results (from a
+    /// superseded request) are ignored.  Returns `Some(status_text)` when
+    /// the result was current and applied, `None` when it was stale.
+    pub fn apply_query_result(&self, result: &QueryResult) -> Option<String> {
+        if result.generation() != self.query_generation.get() {
+            return None;
+        }
+        let desc = self.pending_desc.borrow().clone();
+        match result {
+            QueryResult::Error { message, .. } => Some(format!("Error: {}", message)),
+            QueryResult::Tree {
+                roots, match_count, ..
+            } => {
+                self.root_model.remove_all();
+                for p in roots {
+                    self.root_model.append(&build_node_from_plain(p));
+                }
+                Some(format_status(desc.as_ref(), *match_count))
+            }
+        }
     }
 
     /// List saved drafts for the active profile into the thread model.
@@ -215,9 +275,11 @@ impl AppState {
         self.lua_thread.try_recv().ok()
     }
 
-    /// Process a completed fetch result on the main thread.
-    /// Re-opens the DB and rebuilds the thread tree.
-    pub fn handle_fetch_result(&self, result: &LuaResult) -> Result<String, String> {
+    /// Handle a completed fetch result on the main thread.  Re-opens the
+    /// DB (cheap) and dispatches a worker request to rebuild the list with
+    /// the freshly-indexed data.  The list itself is repopulated
+    /// asynchronously by the query poller.
+    pub fn handle_fetch_result(&self, result: &LuaResult) -> Result<(), String> {
         match result {
             LuaResult::FetchDone { profile_label: _, indexed_count, error } => {
                 if let Some(e) = error {
@@ -229,25 +291,16 @@ impl AppState {
                     return Err("no profile selected".to_string());
                 }
 
-                // Re-open DB to pick up new data indexed by the Lua thread
+                // Re-open the main-thread DB to pick up newly-indexed data.
                 *self.db.borrow_mut() = None;
                 self.open_db(&maildir)?;
 
-                {
-                    let db = self.db.borrow();
-                    let conn = db.as_ref().ok_or("database not open")?;
-                    let query_str = self.active_query.borrow();
-                    if let Some(ref q) = *query_str {
-                        self.rebuild_thread_tree_searched(&maildir, q)?;
-                    } else {
-                        self.rebuild_thread_tree(conn, &maildir)?;
-                    }
-                }
-
-                if *indexed_count == 0 {
-                    Ok("Fetch succeeded — no new mail".to_string())
+                let desc = PendingDesc::Fetch { indexed_count: *indexed_count };
+                let query = self.active_query.borrow().clone();
+                if let Some(q) = query {
+                    self.request_search(q, desc)
                 } else {
-                    Ok(format!("Fetched & indexed {} new messages", indexed_count))
+                    self.request_load_all(desc)
                 }
             }
             LuaResult::InitDone { .. } | LuaResult::InitFailed { .. } => {
@@ -259,207 +312,63 @@ impl AppState {
             }
         }
     }
-
-    /// Rebuild the thread tree from the database (all messages).
-    pub fn rebuild_thread_tree(
-        &self,
-        conn: &Connection,
-        maildir: &std::path::Path,
-    ) -> Result<(), String> {
-        let messages = lorebird_core::store::load_all_messages(conn)
-            .map_err(|e| format!("query failed: {}", e))?;
-        let threads = thread::thread_messages(messages);
-
-        self.root_model.remove_all();
-        let node_tree = ThreadNodeTree::from_threads(&threads, maildir);
-        for root_node in &node_tree.roots {
-            self.root_model.append(root_node);
-        }
-        Ok(())
-    }
-
-    /// Rebuild thread tree filtered by search query.
-    fn rebuild_thread_tree_searched(
-        &self,
-        maildir: &std::path::Path,
-        query: &str,
-    ) -> Result<usize, String> {
-        let parsed = lorebird_core::query::parse_query(query)
-            .map_err(|e| format!("bad query '{}': {:?}", query, e))?;
-        let pq = lorebird_core::query::ParsedQuery::from_ast(&parsed, 5000);
-
-        let db = self.db.borrow();
-        let conn = db.as_ref().ok_or("database not open")?;
-
-        let matched_ids: Vec<String> = lorebird_core::query::search(conn, &pq)
-            .map_err(|e| format!("search failed: {}", e))?;
-        let match_count = matched_ids.len();
-
-        let all_messages = lorebird_core::store::load_all_messages(conn)
-            .map_err(|e| format!("query failed: {}", e))?;
-        let threads = thread::thread_messages(all_messages);
-
-        let thread_index = thread::build_thread_index(&threads);
-        let mut seen_threads: std::collections::HashSet<usize> = std::collections::HashSet::new();
-        for id in &matched_ids {
-            if let Some(&ndx) = thread_index.get(id) {
-                seen_threads.insert(ndx);
-            }
-        }
-
-        self.root_model.remove_all();
-        let node_tree = ThreadNodeTree::from_threads_filtered(&threads, maildir, &seen_threads);
-        for root_node in &node_tree.roots {
-            self.root_model.append(root_node);
-        }
-
-        Ok(match_count)
-    }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
-/// Intermediate tree of `ThreadNode` GObjects.
-struct ThreadNodeTree {
-    roots: Vec<ThreadNode>,
+/// Build a `ThreadNode` GObject tree from a worker-produced `PlainNode`.
+/// Rich fields (To/Cc/body/in-reply-to) are left empty and filled lazily
+/// from disk when the message is previewed.
+fn build_node_from_plain(p: &PlainNode) -> ThreadNode {
+    let node = ThreadNode::new(
+        &p.subject,
+        &p.from,
+        "",
+        "",
+        &p.started,
+        &p.last_reply,
+        p.started_ts,
+        p.last_reply_ts,
+        &p.message_id,
+        &p.references_str,
+        "",
+        &p.date_str,
+        &p.filename,
+    );
+    for child in &p.children {
+        node.add_child(&build_node_from_plain(child));
+    }
+    node
 }
 
-impl ThreadNodeTree {
-    fn from_threads(threads: &[Thread<DbMessage>], maildir: &std::path::Path) -> Self {
-        let roots: Vec<ThreadNode> = threads
-            .iter()
-            .map(|t| Self::build_node(t, maildir))
-            .collect();
-        Self { roots }
-    }
-
-    fn from_threads_filtered(
-        threads: &[Thread<DbMessage>],
-        maildir: &std::path::Path,
-        seen_threads: &std::collections::HashSet<usize>,
-    ) -> Self {
-        let roots: Vec<ThreadNode> = threads
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| seen_threads.contains(i))
-            .map(|(_, t)| Self::build_node(t, maildir))
-            .collect();
-        Self { roots }
-    }
-
-    fn build_node(t: &Thread<DbMessage>, maildir: &std::path::Path) -> ThreadNode {
-        let msg = t.message.as_ref();
-
-        // Try to read the full message from disk for rich data.
-        // Fall back to the DB row data when the file is missing.
-        let parsed = msg.as_ref().and_then(|m| {
-            lorebird_core::store::read_raw_message(maildir, &m.filename)
-        });
-
-        let (from, to, cc, body, parsed_refs, parsed_date, parsed_mid, parsed_irt) =
-            if let Some(ref p) = parsed {
-                (
-                    p.from_addr.clone().unwrap_or_default(),
-                    p.to_addr.clone().unwrap_or_default(),
-                    p.cc_addr.clone().unwrap_or_default(),
-                    p.body_text.clone().unwrap_or_default(),
-                    p.references.join(" "),
-                    p.date_rfc3339.clone().unwrap_or_default(),
-                    p.message_id.clone().unwrap_or_default(),
-                    p.in_reply_to.clone().unwrap_or_default(),
-                )
+/// Format the status-bar text for a completed query, given the pending
+/// description and (for searches) the match count.
+fn format_status(desc: Option<&PendingDesc>, match_count: Option<usize>) -> String {
+    match desc {
+        Some(PendingDesc::AllMail { profile }) => format!("All mail for: {}", profile),
+        Some(PendingDesc::View { name, profile }) => format!(
+            "View \u{2018}{}\u{2019} in: {} \u{2014} {} match(es)",
+            name,
+            profile,
+            match_count.unwrap_or(0)
+        ),
+        Some(PendingDesc::Search) => format!(
+            "Found {} matching message(s) in thread(s)",
+            match_count.unwrap_or(0)
+        ),
+        Some(PendingDesc::ShowAll) => "Showing all threads".to_string(),
+        Some(PendingDesc::Fetch { indexed_count }) => {
+            if *indexed_count == 0 {
+                "Fetch succeeded \u{2014} no new mail".to_string()
             } else {
-                (
-                    msg.as_ref()
-                        .and_then(|m| m.from_addr.clone())
-                        .unwrap_or_default(),
-                    String::new(),
-                    String::new(),
-                    String::new(),
-                    String::new(),
-                    String::new(),
-                    String::new(),
-                    String::new(),
-                )
-            };
-
-        // Fall back to the DB row for fields that parsed may not have.
-        let message_id = if parsed_mid.is_empty() {
-            msg.as_ref()
-                .and_then(|m| m.message_id.clone())
-                .unwrap_or_default()
-        } else {
-            parsed_mid
-        };
-
-        let references_str = if parsed_refs.is_empty() {
-            msg.as_ref()
-                .map(|m| m.references.join(" "))
-                .unwrap_or_default()
-        } else {
-            parsed_refs
-        };
-
-        let date_str = if parsed_date.is_empty() {
-            msg.as_ref()
-                .and_then(|m| m.date.clone())
-                .unwrap_or_default()
-        } else {
-            parsed_date
-        };
-
-        let subject = msg
-            .as_ref()
-            .and_then(|m| m.subject.clone())
-            .unwrap_or_else(|| "(no subject)".to_string());
-
-        // started_ts = root message timestamp (or i64::MAX for ghost nodes)
-        let started_ts = msg
-            .as_ref()
-            .map(|m| m.received_ts)
-            .unwrap_or(i64::MAX);
-        let started = format_relative_time(started_ts);
-
-        // last_reply_ts = most recent timestamp in the whole subtree
-        let last_reply_ts = Self::max_ts(t);
-        let last_reply = format_relative_time(last_reply_ts);
-
-        let in_reply_to = if parsed_irt.is_empty() {
-            String::new()
-        } else {
-            parsed_irt
-        };
-
-        let filename = msg
-            .as_ref()
-            .map(|m| m.filename.clone())
-            .unwrap_or_default();
-
-        let node = ThreadNode::new(
-            &subject, &from, &to, &cc,
-            &started, &last_reply, started_ts, last_reply_ts,
-            &message_id, &references_str, &in_reply_to, &date_str, &filename,
-        );
-        node.set_body_preview(body);
-
-        for child in &t.children {
-            let child_node = Self::build_node(child, maildir);
-            node.add_child(&child_node);
+                format!("Fetched & indexed {} new messages", indexed_count)
+            }
         }
-
-        node
-    }
-
-    /// Find the most recent timestamp in a thread subtree.
-    fn max_ts(t: &Thread<DbMessage>) -> i64 {
-        let own = t.message.as_ref().map(|m| m.received_ts).unwrap_or(0);
-        t.children
-            .iter()
-            .fold(own, |acc, child| acc.max(Self::max_ts(child)))
+        None => "Done".to_string(),
     }
 }
 
-fn format_relative_time(ts: i64) -> String {
+pub(crate) fn format_relative_time(ts: i64) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
