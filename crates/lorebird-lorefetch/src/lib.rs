@@ -403,11 +403,43 @@ fn create_maildir(path: &Path) -> Result<(), LoreError> {
 
 // ── HTTP client ──────────────────────────────────────────────────────
 
-/// What kind of content we detected from the response.
-enum ResponseContent {
-    GzipMbox,
-    RawMbox,
-    Html,
+/// How many bytes to peek to classify a response (mbox vs gzip vs HTML
+/// challenge) without buffering the whole body.
+const PEEK_SIZE: usize = 8192;
+
+/// Result of a single search request: either a streaming mbox reader or the
+/// (small) HTML body of a challenge / error page.
+enum StreamOrHtml {
+    Stream(Box<dyn Read>),
+    Html(String),
+}
+
+/// Map an I/O error from a body read to the right `LoreError`.
+fn map_read_err(e: std::io::Error) -> LoreError {
+    if e.kind() == std::io::ErrorKind::TimedOut
+        || e.to_string().contains("timed out")
+        || e.to_string().contains("Timeout")
+    {
+        LoreError::ReadTimeout(READ_TIMEOUT_SECS)
+    } else {
+        LoreError::Http(format!("reading response: {}", e))
+    }
+}
+
+/// Read up to `n` bytes, tolerating short reads (returns fewer at EOF).
+fn read_prefix<R: Read>(r: &mut R, n: usize) -> Result<Vec<u8>, LoreError> {
+    let mut buf = vec![0u8; n];
+    let mut filled = 0;
+    while filled < n {
+        match r.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(k) => filled += k,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(map_read_err(e)),
+        }
+    }
+    buf.truncate(filled);
+    Ok(buf)
 }
 
 pub struct LoreClient {
@@ -440,8 +472,11 @@ impl LoreClient {
         format!("{}?q={}&x=m", base, urlencoding(query))
     }
 
-    /// Issue a POST request and return the raw response bytes.
-    fn post_raw(&self, agent: &ureq::Agent, search_url: &str) -> Result<Vec<u8>, LoreError> {
+    /// Issue the search POST and return a streaming classification of the
+    /// response. Only a small prefix is buffered to tell mbox from a gzip
+    /// stream from an HTML challenge — the mbox body itself is never fully
+    /// buffered, so memory stays constant regardless of size.
+    fn post_stream(&self, agent: &ureq::Agent, search_url: &str) -> Result<StreamOrHtml, LoreError> {
         let response = agent
             .post(search_url)
             .header("User-Agent", USER_AGENT)
@@ -459,17 +494,15 @@ impl LoreClient {
             .header("Priority", "u=0, i")
             .send_form([("x", "full threads")])
             .map_err(|e| LoreError::Http(format!("POST request failed: {}", e)))?;
-        let status = response.status();
-        let body = response.into_body().with_config().limit(300 * 1024 * 1024).read_to_vec()
-            .map_err(|e| match &e {
-                ureq::Error::Timeout(_) => LoreError::ReadTimeout(READ_TIMEOUT_SECS),
-                _ => LoreError::Http(format!("reading response: {}", e)),
-            })?;
-        // public-inbox answers a search with zero matches as 404 "No results
-        // found" — a normal "caught up" outcome. Other 404s (e.g. a mistyped
-        // list path) are genuine errors, so distinguish them by body.
+
+        let status = response.status().as_u16();
+        let mut reader = response.into_body().into_reader();
+        let head = read_prefix(&mut reader, PEEK_SIZE)?;
+
+        // public-inbox answers a zero-match search with 404 "No results found"
+        // — a normal "caught up" outcome. Other 404s are genuine errors.
         if status == 404 {
-            if String::from_utf8_lossy(&body).contains("No results found") {
+            if String::from_utf8_lossy(&head).contains("No results found") {
                 return Err(LoreError::NoResults);
             }
             return Err(LoreError::Http(format!("request returned status {}", status)));
@@ -477,58 +510,65 @@ impl LoreClient {
         if status != 200 {
             return Err(LoreError::Http(format!("request returned status {}", status)));
         }
-        Ok(body)
-    }
 
-    /// Detect content type from the first bytes of the response.
-    /// For gzip, peeks at the decompressed head to distinguish mbox from HTML.
-    fn detect_content(bytes: &[u8]) -> ResponseContent {
-        if bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b {
-            // Gzip — peek at decompressed content to distinguish mbox from HTML
-            if let Ok(head) = peek_gzip(bytes, 4096) {
-                if head.starts_with(b"From ") {
-                    ResponseContent::GzipMbox
-                } else {
-                    // Gzipped HTML — Anubis challenge or error page
-                    ResponseContent::Html
-                }
-            } else {
-                // Can't decompress header — assume mbox, let the reader fail later
-                ResponseContent::GzipMbox
+        // Gzip stream (lore serves the mbox gzip-compressed via x=m).
+        if head.len() >= 2 && head[0] == 0x1f && head[1] == 0x8b {
+            let chained = std::io::Cursor::new(head).chain(reader);
+            let mut gz = flate2::read::GzDecoder::new(chained);
+            let dhead = read_prefix(&mut gz, 4096)?;
+            if dhead.starts_with(b"From ") {
+                return Ok(StreamOrHtml::Stream(Box::new(std::io::Cursor::new(dhead).chain(gz))));
             }
-        } else if bytes.starts_with(b"From ") {
-            ResponseContent::RawMbox
-        } else {
-            // Anything else is HTML (Anubis challenge or error page)
-            ResponseContent::Html
+            // Gzipped HTML — a (small) challenge or error page.
+            let mut rest = Vec::new();
+            gz.read_to_end(&mut rest).map_err(map_read_err)?;
+            let mut full = dhead;
+            full.extend_from_slice(&rest);
+            return Ok(StreamOrHtml::Html(String::from_utf8_lossy(&full).into_owned()));
         }
+
+        // Raw (uncompressed) mbox.
+        if head.starts_with(b"From ") {
+            return Ok(StreamOrHtml::Stream(Box::new(std::io::Cursor::new(head).chain(reader))));
+        }
+
+        // HTML — read the (bounded) remainder so Anubis can be detected.
+        let mut rest = Vec::new();
+        std::io::Read::take(&mut reader, 4 * 1024 * 1024)
+            .read_to_end(&mut rest)
+            .map_err(map_read_err)?;
+        let mut full = head;
+        full.extend_from_slice(&rest);
+        Ok(StreamOrHtml::Html(String::from_utf8_lossy(&full).into_owned()))
     }
 
-    /// Fetch mbox content, handling Anubis challenges.
-    /// Returns the response bytes as either raw mbox or gzip-compressed mbox.
-    fn fetch_response_bytes(&self, query: &str, list: Option<&str>) -> Result<Vec<u8>, LoreError> {
+    /// Fetch a streaming mbox reader, transparently solving an Anubis
+    /// challenge and retrying once if one is presented.
+    fn fetch_response_reader(&self, query: &str, list: Option<&str>) -> Result<Box<dyn Read>, LoreError> {
         let agent = self.build_agent();
         let search_url = self.search_url(query, list);
         if self.verbose { eprintln!("[lorefetch] Fetching: {}", search_url); }
 
-        let bytes = self.post_raw(&agent, &search_url)?;
-        match Self::detect_content(&bytes) {
-            ResponseContent::Html => {
-                let body = String::from_utf8_lossy(&bytes).to_string();
+        match self.post_stream(&agent, &search_url)? {
+            StreamOrHtml::Stream(r) => Ok(r),
+            StreamOrHtml::Html(body) => {
                 if body.contains("anubis_challenge") || body.contains("Making sure you&#39;re not a bot") {
                     if self.verbose { eprintln!("[lorefetch] Detected Anubis, solving challenge..."); }
-                    let retry_bytes = self.solve_anubis(&agent, &body, &search_url)?;
-                    // Retry should be mbox (gzip or raw)
-                    Ok(retry_bytes)
+                    self.solve_anubis(&agent, &body, &search_url)?;
+                    match self.post_stream(&agent, &search_url)? {
+                        StreamOrHtml::Stream(r) => Ok(r),
+                        StreamOrHtml::Html(_) => Err(LoreError::NotMbox),
+                    }
                 } else {
                     Err(LoreError::NotMbox)
                 }
             }
-            ResponseContent::RawMbox | ResponseContent::GzipMbox => Ok(bytes),
         }
     }
 
-    fn solve_anubis(&self, agent: &ureq::Agent, body: &str, search_url: &str) -> Result<Vec<u8>, LoreError> {
+    /// Solve an Anubis challenge and submit the solution. The caller re-issues
+    /// the search afterwards.
+    fn solve_anubis(&self, agent: &ureq::Agent, body: &str, search_url: &str) -> Result<(), LoreError> {
         let challenge = detect_anubis(body).ok_or_else(|| {
             LoreError::Anubis("could not extract Anubis challenge data".to_string())
         })?;
@@ -552,27 +592,17 @@ impl LoreClient {
                 "challenge submission returned status {}", pass_resp.status())));
         }
 
-        if self.verbose { eprintln!("[lorefetch] Retry after challenge..."); }
-        self.post_raw(agent, search_url)
+        if self.verbose { eprintln!("[lorefetch] Challenge solved"); }
+        Ok(())
     }
 
     /// Fetch raw mbox content and write to a file.
     /// Used by the `--mbox` CLI flag.  Streams through GzDecoder
     /// and writes the decompressed content to the file.
     pub fn fetch_mbox_to_file(&self, query: &str, list: Option<&str>, path: &Path) -> Result<usize, LoreError> {
-        let bytes = self.fetch_response_bytes(query, list)?;
-        // fetch_response_bytes handles Anubis; if we get here, it should be mbox
-        let mut reader = make_reader(bytes)?;
+        let mut reader = self.fetch_response_reader(query, list)?;
         let mut buf = Vec::new();
-        reader.read_to_end(&mut buf)
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::TimedOut
-                    || e.to_string().contains("timed out") {
-                    LoreError::ReadTimeout(READ_TIMEOUT_SECS)
-                } else {
-                    LoreError::Http(format!("reading response: {}", e))
-                }
-            })?;
+        reader.read_to_end(&mut buf).map_err(map_read_err)?;
         let written = buf.len();
         std::fs::write(path, &buf)?;
         Ok(written)
@@ -580,28 +610,6 @@ impl LoreClient {
 }
 
 
-
-/// Peek at the first `n` bytes of a gzip-compressed buffer.
-/// Returns the decompressed bytes, or an error if decompression fails.
-fn peek_gzip(bytes: &[u8], n: usize) -> Result<Vec<u8>, ()> {
-    let mut gz = flate2::read::GzDecoder::new(bytes);
-    let mut buf = vec![0u8; n];
-    let read = std::io::Read::read(&mut gz, &mut buf).map_err(|_| ())?;
-    buf.truncate(read);
-    Ok(buf)
-}
-
-/// Build a streaming reader that owns the response bytes.
-/// Decompresses gzip if magic bytes are detected.
-fn make_reader(bytes: Vec<u8>) -> Result<Box<dyn Read + Send>, LoreError> {
-    if bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b {
-        // Gzip — wrap in streaming decompressor that reads from the owned bytes
-        let reader = std::io::Cursor::new(bytes);
-        Ok(Box::new(flate2::read::GzDecoder::new(reader)))
-    } else {
-        Ok(Box::new(std::io::Cursor::new(bytes)))
-    }
-}
 
 // ── Minimal URL-encoding ─────────────────────────────────────────────
 
@@ -656,10 +664,12 @@ pub fn fetch_to_maildir(
         }
     };
 
-    // 4. Fetch response bytes (handles Anubis if needed)
+    // 4. Open a streaming reader for the response (handles Anubis if needed).
+    //    The mbox is never fully buffered — memory stays constant regardless
+    //    of size, and there is no per-response size cap.
     let client = LoreClient::new().verbose(verbose);
-    let bytes = match client.fetch_response_bytes(&effective_query, list) {
-        Ok(b) => b,
+    let reader = match client.fetch_response_reader(&effective_query, list) {
+        Ok(r) => r,
         Err(LoreError::NoResults) => {
             if verbose { eprintln!("[lorefetch] No new results — caught up"); }
             return Ok(FetchResult { new_messages: 0, total_messages: 0, timed_out: false });
@@ -667,10 +677,7 @@ pub fn fetch_to_maildir(
         Err(e) => return Err(e),
     };
 
-    // 6. Create streaming reader and process messages
-    let reader = make_reader(bytes)?;
-
-    // 7. Stream through MboxParser → process each message
+    // 5. Stream through MboxParser → process each message
     let mut parser = MboxParser::new(reader);
     let new_dir = maildir.join("new");
     let mut num_saved = 0usize;
@@ -843,28 +850,16 @@ mod tests {
     }
 
     #[test]
-    fn detect_content_gzip() {
-        let gz: Vec<u8> = vec![0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00];
-        match LoreClient::detect_content(&gz) {
-            ResponseContent::GzipMbox => {}
-            _ => panic!("expected GzipMbox"),
-        }
-    }
+    fn read_prefix_handles_short_and_full() {
+        // Fewer bytes than requested (EOF) returns what's available.
+        let mut src = std::io::Cursor::new(b"From abc".to_vec());
+        let got = read_prefix(&mut src, 4096).unwrap();
+        assert_eq!(got, b"From abc");
 
-    #[test]
-    fn detect_content_html() {
-        match LoreClient::detect_content(b"<!DOCTYPE html><html>") {
-            ResponseContent::Html => {}
-            _ => panic!("expected Html"),
-        }
-    }
-
-    #[test]
-    fn detect_content_mbox() {
-        match LoreClient::detect_content(b"From sender@example.com Mon Jan  2") {
-            ResponseContent::RawMbox => {}
-            _ => panic!("expected RawMbox"),
-        }
+        // Exactly the requested count.
+        let mut src = std::io::Cursor::new(vec![b'x'; 100]);
+        let got = read_prefix(&mut src, 10).unwrap();
+        assert_eq!(got.len(), 10);
     }
 
     #[test]
@@ -999,49 +994,47 @@ mod tests {
         assert!(validate_maildir(md).is_err());
     }
 
+    /// Mirror the streaming classification in `post_stream`: peek the raw
+    /// prefix, detect gzip by magic, decode-and-peek to confirm mbox, then
+    /// stream the rest through `Cursor(decoded_head).chain(gz)` losslessly.
     #[test]
-    fn make_reader_raw() {
-        let data = b"From a@b.com\nMessage-ID: <x>\n\nBody\n".to_vec();
-        let mut r = make_reader(data).unwrap();
-        let mut buf = Vec::new();
-        r.read_to_end(&mut buf).unwrap();
-        assert_eq!(&buf, b"From a@b.com\nMessage-ID: <x>\n\nBody\n");
-    }
-
-    #[test]
-    fn make_reader_gzip() {
-        let original = b"From a@b.com\nMessage-ID: <x>\n\nBody\n";
+    fn streaming_gzip_mbox_roundtrip() {
+        let original = b"From a@b.com\nMessage-ID: <x>\n\nBody\nFrom c@d.com\nMessage-ID: <y>\n\nMore\n";
         let mut compressed = Vec::new();
         let mut gz = flate2::write::GzEncoder::new(&mut compressed, flate2::Compression::default());
         std::io::Write::write_all(&mut gz, original).unwrap();
         gz.finish().unwrap();
-        let compressed_vec = compressed.clone();
-        let mut r = make_reader(compressed_vec).unwrap();
-        let mut buf = Vec::new();
-        r.read_to_end(&mut buf).unwrap();
-        assert_eq!(&buf, original);
+
+        // Stand-in for the HTTP body reader.
+        let mut body = std::io::Cursor::new(compressed);
+        let head = read_prefix(&mut body, PEEK_SIZE).unwrap();
+        assert!(head.len() >= 2 && head[0] == 0x1f && head[1] == 0x8b, "gzip magic");
+
+        let chained = std::io::Cursor::new(head).chain(body);
+        let mut gzr = flate2::read::GzDecoder::new(chained);
+        let dhead = read_prefix(&mut gzr, 4096).unwrap();
+        assert!(dhead.starts_with(b"From "), "decoded head is mbox");
+
+        let mut stream = std::io::Cursor::new(dhead).chain(gzr);
+        let mut out = Vec::new();
+        stream.read_to_end(&mut out).unwrap();
+        assert_eq!(&out, original, "no bytes lost across the peek boundary");
     }
 
     #[test]
-    fn peek_gzip_identifies_mbox() {
-        let original = b"From sender@example.com\nMessage-ID: <abc>\n\nBody\n";
+    fn streaming_detects_gzipped_html() {
+        let original = b"<!DOCTYPE html><html>anubis_challenge</html>";
         let mut compressed = Vec::new();
         let mut gz = flate2::write::GzEncoder::new(&mut compressed, flate2::Compression::default());
         std::io::Write::write_all(&mut gz, original).unwrap();
         gz.finish().unwrap();
-        let head = peek_gzip(&compressed, 4096).unwrap();
-        assert!(head.starts_with(b"From "));
-    }
 
-    #[test]
-    fn peek_gzip_identifies_html() {
-        let original = b"<!DOCTYPE html><html>error</html>";
-        let mut compressed = Vec::new();
-        let mut gz = flate2::write::GzEncoder::new(&mut compressed, flate2::Compression::default());
-        std::io::Write::write_all(&mut gz, original).unwrap();
-        gz.finish().unwrap();
-        let head = peek_gzip(&compressed, 4096).unwrap();
-        assert!(!head.starts_with(b"From "));
-        assert!(head.starts_with(b"<"));
+        let mut body = std::io::Cursor::new(compressed);
+        let head = read_prefix(&mut body, PEEK_SIZE).unwrap();
+        let chained = std::io::Cursor::new(head).chain(body);
+        let mut gzr = flate2::read::GzDecoder::new(chained);
+        let dhead = read_prefix(&mut gzr, 4096).unwrap();
+        assert!(!dhead.starts_with(b"From "));
+        assert!(dhead.starts_with(b"<"));
     }
 }
