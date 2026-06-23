@@ -122,8 +122,17 @@ impl ParsedQuery {
         match query {
             Query::Date(range) => (String::new(), Some(range.clone())),
             Query::Field { prefix, value } => {
-                let col = map_prefix_to_column(prefix);
                 let escaped = value.replace('"', "\"\"");
+                // `a:`/`addr:` matches the address across From, To and Cc
+                // (mirrors lorefetch's `a:` prefix).
+                if matches!(prefix.to_lowercase().as_str(), "a" | "addr") {
+                    let term = format!(
+                        "(from:\"{e}\" OR to:\"{e}\" OR cc:\"{e}\")",
+                        e = escaped
+                    );
+                    return (term, None);
+                }
+                let col = map_prefix_to_column(prefix);
                 let term = match col {
                     Some(c) => format!("{}:\"{}\"", c, escaped),
                     None => value.split_whitespace()
@@ -168,6 +177,7 @@ fn map_prefix_to_column(prefix: &str) -> Option<&'static str> {
         "b" | "body" => Some("body"),
         "to" => Some("to"),
         "cc" => Some("cc"),
+        "l" | "list" => Some("list_id"),
         _ => None, // unknown prefix → search all columns
     }
 }
@@ -726,6 +736,21 @@ mod tests {
     fn fts5_field_phrase() {
         let q = Query::Field { prefix: "subject".into(), value: "meeting notes".into() };
         assert_eq!(query_to_fts5(&q), "subject:\"meeting notes\"");
+    }
+
+    #[test]
+    fn fts5_addr_prefix_spans_from_to_cc() {
+        let q = Query::Field { prefix: "a".into(), value: "me@example.com".into() };
+        assert_eq!(
+            query_to_fts5(&q),
+            "(from:\"me@example.com\" OR to:\"me@example.com\" OR cc:\"me@example.com\")"
+        );
+    }
+
+    #[test]
+    fn fts5_list_prefix() {
+        let q = Query::Field { prefix: "l".into(), value: "linux-nvme.lists.infradead.org".into() };
+        assert_eq!(query_to_fts5(&q), "list_id:\"linux-nvme.lists.infradead.org\"");
     }
 
     #[test]

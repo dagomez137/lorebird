@@ -18,6 +18,9 @@ pub struct MailMessage {
     pub from_addr: Option<String>,
     pub to_addr: Option<String>,
     pub cc_addr: Option<String>,
+    /// The List-Id header value (e.g. `Linux NVMe <linux-nvme.lists.infradead.org>`),
+    /// used to filter a combined maildir down to a single mailing list.
+    pub list_id: Option<String>,
     pub date_rfc3339: Option<String>,
     pub date_ts: i64,
     pub received_ts: i64,
@@ -56,6 +59,14 @@ impl MailMessage {
         let to_addr = all_addrs(msg.to());
         let cc_addr = all_addrs(msg.cc());
 
+        // mail_parser parses List-Id as an address header, so its value isn't
+        // plain text. Read the raw header instead and keep it verbatim (e.g.
+        // `Linux NVMe <linux-nvme.lists.infradead.org>`).
+        let list_id = msg
+            .header_raw("List-Id")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
         let date_rfc3339 = msg.date().map(|d| d.to_rfc3339());
         let date_ts = msg.date().map(|d| d.to_timestamp() as i64).unwrap_or(0);
 
@@ -75,6 +86,7 @@ impl MailMessage {
             from_addr,
             to_addr,
             cc_addr,
+            list_id,
             date_rfc3339,
             date_ts,
             received_ts,
@@ -214,6 +226,23 @@ mod tests {
         let raw = b"To: a@b.com, c@d.com\r\nMessage-ID: <x@y>\r\n\r\nhi";
         let msg = MailMessage::from_bytes(raw).unwrap();
         assert_eq!(msg.to_addr.as_deref(), Some("a@b.com, c@d.com"));
+    }
+
+    #[test]
+    fn parse_list_id() {
+        let raw = b"List-Id: Linux NVMe <linux-nvme.lists.infradead.org>\r\nMessage-ID: <x@y>\r\n\r\nhi";
+        let msg = MailMessage::from_bytes(raw).unwrap();
+        assert_eq!(
+            msg.list_id.as_deref(),
+            Some("Linux NVMe <linux-nvme.lists.infradead.org>")
+        );
+    }
+
+    #[test]
+    fn parse_no_list_id() {
+        let raw = b"From: a@b.com\r\nMessage-ID: <x@y>\r\n\r\nhi";
+        let msg = MailMessage::from_bytes(raw).unwrap();
+        assert_eq!(msg.list_id, None);
     }
 
     #[test]

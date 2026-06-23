@@ -37,6 +37,7 @@ pub fn init_db(conn: &Connection) -> SqlResult<()> {
             subject,
             \"to\",
             cc,
+            list_id,    -- from List-Id: header, for per-list views
             body
         );
         ",

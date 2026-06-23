@@ -142,8 +142,8 @@ fn index_maildir_inner(conn: &Connection, maildir_path: &Path) -> SqlResult<usiz
 
             // ── mail_fts ──
             conn.execute(
-                "INSERT INTO mail_fts (message_id, date, \"from\", subject, \"to\", cc, body)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO mail_fts (message_id, date, \"from\", subject, \"to\", cc, list_id, body)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     msg_id,
                     msg.date_rfc3339,
@@ -151,6 +151,7 @@ fn index_maildir_inner(conn: &Connection, maildir_path: &Path) -> SqlResult<usiz
                     msg.subject,
                     msg.to_addr,
                     msg.cc_addr,
+                    msg.list_id,
                     msg.body_text,
                 ],
             )?;
