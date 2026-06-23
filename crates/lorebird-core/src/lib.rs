@@ -1,9 +1,12 @@
+pub mod archive;
 pub mod compose;
 pub mod config_dir;
+pub mod follows;
 pub mod indexer;
 pub mod maildir;
 pub mod message;
 pub mod query;
 pub mod schema;
+pub mod series;
 pub mod store;
 pub mod thread;

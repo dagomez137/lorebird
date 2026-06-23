@@ -27,6 +27,7 @@ use crate::folder_item::{FolderItem, FolderKind};
 use crate::lua_thread::LuaCommand;
 use crate::thread_node::ThreadNode;
 use lorebird_core::compose::Mail;
+use lorebird_core::follows::Follow;
 
 // ── Public entry point ─────────────────────────────────────────────
 
@@ -99,6 +100,16 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
 
     // Sidebar (built from config)
     let (sidebar_scrolled, sidebar_model, sidebar_lb) = build_sidebar(&state_ref);
+
+    // Clones of the sidebar model for live follow/unfollow mutation, and the
+    // profile that followed-series rows run against (the first, alphabetically).
+    let sidebar_model_for_follow = sidebar_model.clone();
+    let sidebar_model_for_unfollow = sidebar_model.clone();
+    let default_profile = {
+        let mut v: Vec<String> = state_ref.profiles.keys().cloned().collect();
+        v.sort();
+        v.into_iter().next().unwrap_or_default()
+    };
 
     outer_paned.set_start_child(Some(&sidebar_scrolled));
     outer_paned.set_shrink_start_child(false);
@@ -259,6 +270,7 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
         reply_btn_sidebar.set_sensitive(!matches!(kind, FolderKind::Drafts));
 
         let s = state_for_sidebar.borrow();
+        s.set_active_is_inbox(false);
 
         match kind {
             FolderKind::ProfileHeader => {
@@ -304,7 +316,7 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
                 }
                 search_for_sidebar.set_text("");
             }
-            FolderKind::View => {
+            FolderKind::View | FolderKind::Follow => {
                 s.select_profile(&profile);
 
                 // Open existing DB if available
@@ -320,13 +332,22 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
                     return;
                 }
 
-                // Run the view's query
-                s.select_view(query.to_string());
+                // The inbox view folds in followed series flagged "add to inbox".
+                let is_inbox = item.is_inbox();
+                s.set_active_is_inbox(is_inbox);
+                let effective = if is_inbox {
+                    s.augment_inbox_query(&query)
+                } else {
+                    query.to_string()
+                };
+
+                // Run the (possibly augmented) query
+                s.select_view(effective.clone());
                 search_for_sidebar.set_text(&query);
                 spinner_for_sidebar.set_spinning(true);
                 status_for_sidebar.set_text("Searching\u{2026}");
                 if let Err(e) = s.request_search(
-                    query.to_string(),
+                    effective,
                     PendingDesc::View {
                         name: item.name().to_string(),
                         profile: profile.to_string(),
@@ -474,9 +495,35 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     let context_menu = gtk4::Popover::new();
     let menu_box = Box::new(Orientation::Vertical, 0);
     context_menu.set_parent(&column_view);
+    // Follow / Archive / Unarchive buttons (reply / edit-draft / delete-draft
+    // are created near the top of the function so the sidebar callback can
+    // toggle their sensitivity).
+    let follow_menu_btn = gtk4::Button::with_label("Follow series\u{2026}");
+    follow_menu_btn.add_css_class("flat");
+    follow_menu_btn.set_margin_top(4);
+    follow_menu_btn.set_margin_bottom(4);
+    follow_menu_btn.set_margin_start(8);
+    follow_menu_btn.set_margin_end(8);
+    let archive_menu_btn = gtk4::Button::with_label("Archive series");
+    archive_menu_btn.add_css_class("flat");
+    archive_menu_btn.set_margin_top(4);
+    archive_menu_btn.set_margin_bottom(4);
+    archive_menu_btn.set_margin_start(8);
+    archive_menu_btn.set_margin_end(8);
+    let unarchive_menu_btn = gtk4::Button::with_label("Unarchive series");
+    unarchive_menu_btn.add_css_class("flat");
+    unarchive_menu_btn.set_margin_top(4);
+    unarchive_menu_btn.set_margin_bottom(4);
+    unarchive_menu_btn.set_margin_start(8);
+    unarchive_menu_btn.set_margin_end(8);
+    let archive_separator = gtk4::Separator::new(Orientation::Horizontal);
     menu_box.append(&reply_menu_btn);
     menu_box.append(&edit_draft_btn);
     menu_box.append(&delete_draft_btn);
+    menu_box.append(&follow_menu_btn);
+    menu_box.append(&archive_separator);
+    menu_box.append(&archive_menu_btn);
+    menu_box.append(&unarchive_menu_btn);
     context_menu.set_child(Some(&menu_box));
 
     let state_for_ctx = state.clone();
@@ -533,12 +580,91 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
         );
     });
 
+    // "Follow series" → confirm dialog, then persist + add sidebar row.
+    let state_for_follow = state.clone();
+    let selected_for_follow = selected_node.clone();
+    let status_for_follow = status_label.clone();
+    let window_for_follow = window.clone();
+    let sbmodel_for_follow_btn = sidebar_model_for_follow.clone();
+    let defprofile_for_follow = default_profile.clone();
+    let spinner_for_follow = spinner.clone();
+    let context_menu_for_follow = context_menu.clone();
+    follow_menu_btn.connect_clicked(move |_btn| {
+        context_menu_for_follow.popdown();
+        let subject = selected_for_follow.borrow().as_ref().map(|n| n.subject());
+        match subject {
+            Some(subject) if !subject.is_empty() => open_follow_dialog(
+                &window_for_follow,
+                &state_for_follow,
+                &sbmodel_for_follow_btn,
+                &defprofile_for_follow,
+                &spinner_for_follow,
+                &status_for_follow,
+                &subject,
+            ),
+            _ => status_for_follow.set_text("Select a thread to follow its series"),
+        }
+    });
+
+    // "Archive series" → hide the whole series from filtered views (still in
+    // All Mail), then refresh the current list.
+    let state_for_archive = state.clone();
+    let selected_for_archive = selected_node.clone();
+    let status_for_archive = status_label.clone();
+    let spinner_for_archive = spinner.clone();
+    let context_menu_for_archive = context_menu.clone();
+    archive_menu_btn.connect_clicked(move |_btn| {
+        context_menu_for_archive.popdown();
+        let subject = selected_for_archive.borrow().as_ref().map(|n| n.subject());
+        let Some(subject) = subject.filter(|s| !s.is_empty()) else {
+            status_for_archive.set_text("Select a thread to archive its series");
+            return;
+        };
+        let s = state_for_archive.borrow();
+        match s.archive_series(&subject) {
+            Ok(n) => {
+                status_for_archive.set_text(&format!("Archived {} message(s)", n));
+                spinner_for_archive.set_spinning(true);
+                let _ = s.rerun_active_view();
+            }
+            Err(e) => status_for_archive.set_text(&format!("Archive failed: {}", e)),
+        }
+    });
+
+    // "Unarchive series" → bring the series back into filtered views.
+    let state_for_unarchive = state.clone();
+    let selected_for_unarchive = selected_node.clone();
+    let status_for_unarchive = status_label.clone();
+    let spinner_for_unarchive = spinner.clone();
+    let context_menu_for_unarchive = context_menu.clone();
+    unarchive_menu_btn.connect_clicked(move |_btn| {
+        context_menu_for_unarchive.popdown();
+        let subject = selected_for_unarchive.borrow().as_ref().map(|n| n.subject());
+        let Some(subject) = subject.filter(|s| !s.is_empty()) else {
+            status_for_unarchive.set_text("Select a thread to unarchive its series");
+            return;
+        };
+        let s = state_for_unarchive.borrow();
+        match s.unarchive_series(&subject) {
+            Ok(n) => {
+                status_for_unarchive.set_text(&format!("Unarchived {} message(s)", n));
+                spinner_for_unarchive.set_spinning(true);
+                let _ = s.rerun_active_view();
+            }
+            Err(e) => status_for_unarchive.set_text(&format!("Unarchive failed: {}", e)),
+        }
+    });
+
     // Right-click gesture on the column view
     let ctx_menu_ref = context_menu.clone();
     let column_view_for_gesture = column_view.clone();
     let reply_menu_btn_gesture = reply_menu_btn.clone();
     let edit_draft_btn_gesture = edit_draft_btn.clone();
     let delete_draft_btn_gesture = delete_draft_btn.clone();
+    let follow_menu_btn_gesture = follow_menu_btn.clone();
+    let archive_menu_btn_gesture = archive_menu_btn.clone();
+    let unarchive_menu_btn_gesture = unarchive_menu_btn.clone();
+    let archive_sep_gesture = archive_separator.clone();
     let gesture = gtk4::GestureClick::new();
     gesture.set_button(gtk4::gdk::BUTTON_SECONDARY);
     let selected_for_gesture = selected_node.clone();
@@ -549,17 +675,27 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
             return;
         }
 
-        // Show only applicable entries based on folder kind.
+        // Show only applicable entries based on folder kind.  Drafts get
+        // edit/delete; mail folders get reply plus the follow/archive series
+        // actions.
         match *kind_for_gesture.borrow() {
             FolderKind::Drafts => {
                 reply_menu_btn_gesture.set_visible(false);
                 edit_draft_btn_gesture.set_visible(true);
                 delete_draft_btn_gesture.set_visible(true);
+                follow_menu_btn_gesture.set_visible(false);
+                archive_sep_gesture.set_visible(false);
+                archive_menu_btn_gesture.set_visible(false);
+                unarchive_menu_btn_gesture.set_visible(false);
             }
             _ => {
                 reply_menu_btn_gesture.set_visible(true);
                 edit_draft_btn_gesture.set_visible(false);
                 delete_draft_btn_gesture.set_visible(false);
+                follow_menu_btn_gesture.set_visible(true);
+                archive_sep_gesture.set_visible(true);
+                archive_menu_btn_gesture.set_visible(true);
+                unarchive_menu_btn_gesture.set_visible(true);
             }
         }
 
@@ -590,6 +726,55 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
             is_dark,
         );
     });
+
+    // ── Unfollow (right-click on a followed sidebar row) ──────────
+    let unfollow_popover = gtk4::Popover::new();
+    let unfollow_btn = gtk4::Button::with_label("Unfollow");
+    unfollow_btn.add_css_class("flat");
+    unfollow_btn.set_margin_top(4);
+    unfollow_btn.set_margin_bottom(4);
+    unfollow_btn.set_margin_start(8);
+    unfollow_btn.set_margin_end(8);
+    unfollow_popover.set_child(Some(&unfollow_btn));
+    unfollow_popover.set_has_arrow(false);
+    unfollow_popover.set_parent(&sidebar_lb);
+
+    // The query of the row the popover currently targets.
+    let unfollow_target: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+
+    let state_for_unfollow = state.clone();
+    let target_for_btn = unfollow_target.clone();
+    let popover_for_btn = unfollow_popover.clone();
+    let sbmodel_for_unfollow_btn = sidebar_model_for_unfollow.clone();
+    let defprofile_for_unfollow = default_profile.clone();
+    unfollow_btn.connect_clicked(move |_btn| {
+        popover_for_btn.popdown();
+        if let Some(query) = target_for_btn.borrow_mut().take() {
+            let s = state_for_unfollow.borrow();
+            s.remove_follow(&query);
+            refresh_follow_rows(&sbmodel_for_unfollow_btn, &defprofile_for_unfollow, &s.follows.borrow());
+        }
+    });
+
+    let sidebar_lb_for_gesture = sidebar_lb.clone();
+    let model_for_unfollow = sidebar_model_for_unfollow.clone();
+    let target_for_gesture = unfollow_target.clone();
+    let popover_for_gesture = unfollow_popover.clone();
+    let unfollow_gesture = gtk4::GestureClick::new();
+    unfollow_gesture.set_button(gtk4::gdk::BUTTON_SECONDARY);
+    unfollow_gesture.connect_pressed(move |_g, _n, x, y| {
+        let Some(row) = sidebar_lb_for_gesture.row_at_y(y as i32) else { return };
+        let idx = row.index() as u32;
+        let Some(item) = model_for_unfollow.item(idx).and_downcast::<FolderItem>() else { return };
+        if FolderKind::from_str(&item.row_kind()) != Some(FolderKind::Follow) {
+            return;
+        }
+        *target_for_gesture.borrow_mut() = Some(item.query());
+        let rect = gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1);
+        popover_for_gesture.set_pointing_to(Some(&rect));
+        popover_for_gesture.popup();
+    });
+    sidebar_lb.add_controller(unfollow_gesture);
 
     // ── Ctrl+R keybind for Reply ───────────────────────────────────
     let state_for_reply = state.clone();
@@ -977,10 +1162,15 @@ fn build_sidebar(state: &AppState) -> (ScrolledWindow, ListStore, gtk4::ListBox)
         sidebar_model.append(&FolderItem::drafts(label));
         // Views
         for view in &profile.views {
-            sidebar_model.append(&FolderItem::view(label, &view.label, &view.query));
+            sidebar_model.append(&FolderItem::view(label, &view.label, &view.query, view.inbox));
         }
         // Separator (modelled as a disabled item)
         sidebar_model.append(&FolderItem::separator());
+    }
+
+    // Followed series section (global; rows run against the first profile).
+    if let Some(def) = profile_labels.first() {
+        refresh_follow_rows(&sidebar_model, def, &state.follows.borrow());
     }
 
     // If no profiles, show a helpful placeholder
@@ -1008,6 +1198,147 @@ fn build_sidebar(state: &AppState) -> (ScrolledWindow, ListStore, gtk4::ListBox)
 
     scrolled.set_child(Some(&list_box));
     (scrolled, sidebar_model, list_box)
+}
+
+/// Rebuild the "Followed" section of the sidebar model in place: remove any
+/// existing follow / follow-header rows (always at the tail) and re-append
+/// from `follows`. Safe to call at build time and after follow/unfollow.
+fn refresh_follow_rows(model: &ListStore, profile: &str, follows: &[Follow]) {
+    let mut i = model.n_items();
+    while i > 0 {
+        i -= 1;
+        if let Some(item) = model.item(i).and_downcast::<FolderItem>() {
+            let kind = item.row_kind();
+            if kind == "follow" || kind == "follow-header" {
+                model.remove(i);
+            }
+        }
+    }
+    if follows.is_empty() {
+        return;
+    }
+    model.append(&FolderItem::follow_header());
+    for f in follows {
+        model.append(&FolderItem::follow(profile, &f.label, &f.query));
+    }
+}
+
+/// Confirm dialog for following a series. Prefills the label and match phrase
+/// from the normalised subject and lets the user tweak them before saving.
+fn open_follow_dialog(
+    parent: &ApplicationWindow,
+    state: &Rc<RefCell<AppState>>,
+    sidebar_model: &ListStore,
+    default_profile: &str,
+    spinner: &Spinner,
+    status: &Label,
+    subject: &str,
+) {
+    let key = lorebird_core::series::series_key(subject);
+
+    let dialog = gtk4::Window::builder()
+        .title("Follow series")
+        .transient_for(parent)
+        .modal(true)
+        .default_width(460)
+        .build();
+
+    let vbox = Box::new(Orientation::Vertical, 10);
+    vbox.set_margin_top(16);
+    vbox.set_margin_bottom(16);
+    vbox.set_margin_start(16);
+    vbox.set_margin_end(16);
+
+    let intro = Label::new(Some(
+        "Follow this series — matching threads stay one click away, across every version (past and future).",
+    ));
+    intro.set_wrap(true);
+    intro.set_xalign(0.0);
+    intro.add_css_class("dim-label");
+    vbox.append(&intro);
+
+    let label_lbl = Label::new(Some("Label"));
+    label_lbl.set_xalign(0.0);
+    let label_entry = gtk4::Entry::new();
+    label_entry.set_text(&key);
+    vbox.append(&label_lbl);
+    vbox.append(&label_entry);
+
+    let match_lbl = Label::new(Some("Match subject (phrase)"));
+    match_lbl.set_xalign(0.0);
+    let match_entry = gtk4::Entry::new();
+    match_entry.set_text(&key);
+    vbox.append(&match_lbl);
+    vbox.append(&match_entry);
+
+    let inbox_check = gtk4::CheckButton::with_label("Add to inbox");
+    inbox_check.set_active(true);
+    vbox.append(&inbox_check);
+
+    let btn_box = Box::new(Orientation::Horizontal, 8);
+    btn_box.set_halign(gtk4::Align::End);
+    btn_box.set_margin_top(8);
+    let cancel_btn = gtk4::Button::with_label("Cancel");
+    let follow_btn = gtk4::Button::with_label("Follow");
+    follow_btn.add_css_class("suggested-action");
+    btn_box.append(&cancel_btn);
+    btn_box.append(&follow_btn);
+    vbox.append(&btn_box);
+
+    dialog.set_child(Some(&vbox));
+
+    let dialog_for_cancel = dialog.clone();
+    cancel_btn.connect_clicked(move |_| dialog_for_cancel.close());
+
+    let state_c = state.clone();
+    let sbmodel_c = sidebar_model.clone();
+    let defprofile_c = default_profile.to_string();
+    let spinner_c = spinner.clone();
+    let status_c = status.clone();
+    let dialog_c = dialog.clone();
+    let label_entry_c = label_entry.clone();
+    let match_entry_c = match_entry.clone();
+    let inbox_check_c = inbox_check.clone();
+    follow_btn.connect_clicked(move |_| {
+        let m = match_entry_c.text().to_string().trim().to_string();
+        if m.is_empty() {
+            status_c.set_text("Match phrase is empty — not followed");
+            dialog_c.close();
+            return;
+        }
+        let mut label = label_entry_c.text().to_string();
+        if label.trim().is_empty() {
+            label = m.clone();
+        }
+        let query = format!("subject:\"{}\"", m.replace('"', ""));
+
+        let s = state_c.borrow();
+        if s.is_followed(&query) {
+            status_c.set_text(&format!("Already following: {}", label));
+        } else {
+            s.add_follow(Follow {
+                label: label.clone(),
+                query: query.clone(),
+                in_inbox: inbox_check_c.is_active(),
+            });
+            status_c.set_text(&format!("Following: {}", label));
+        }
+        refresh_follow_rows(&sbmodel_c, &defprofile_c, &s.follows.borrow());
+
+        // If the inbox is on screen and this series joins it, re-run the query.
+        if inbox_check_c.is_active() && s.active_is_inbox() {
+            if let Some(base) = s.inbox_base_query() {
+                let q = s.augment_inbox_query(&base);
+                spinner_c.set_spinning(true);
+                let profile = s.active_profile.borrow().clone();
+                let _ = s.request_search(q, PendingDesc::View { name: "inbox".to_string(), profile });
+            }
+        }
+        drop(s);
+        dialog_c.close();
+    });
+
+    dialog.present();
 }
 
 /// Build a `ListBoxRow` widget for a `FolderItem`.
@@ -1056,7 +1387,7 @@ fn make_sidebar_row(item: &FolderItem) -> ListBoxRow {
     let label = Label::new(Some(&item.name()));
     label.set_hexpand(true);
     label.set_xalign(0.0);
-    if matches!(kind, FolderKind::ProfileHeader) {
+    if matches!(kind, FolderKind::ProfileHeader | FolderKind::FollowHeader) {
         label.add_css_class("heading");
         label.add_css_class("caption");
     }
@@ -1073,8 +1404,11 @@ fn make_sidebar_row(item: &FolderItem) -> ListBoxRow {
     let row = ListBoxRow::new();
     row.set_child(Some(&hbox));
 
-    if matches!(kind, FolderKind::ProfileHeader) {
-        // Headers are selectable (they set the active profile)
+    // Profile headers stay selectable (they set the active profile).
+    // The "Followed" header is a label only — not a selectable row.
+    if matches!(kind, FolderKind::FollowHeader) {
+        row.set_selectable(false);
+        row.set_activatable(false);
     }
 
     row

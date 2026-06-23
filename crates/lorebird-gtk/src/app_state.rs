@@ -15,6 +15,7 @@ use rusqlite::Connection;
 use crate::lua_thread::{InitResult, LuaCommand, LuaResult, LuaThread};
 use crate::query_thread::{PlainNode, QueryCommand, QueryResult, QueryThread};
 use crate::thread_node::ThreadNode;
+use lorebird_core::follows::Follow;
 use lorebird_lua::ResolvedProfile;
 
 /// Describes an in-flight query request so the poller can produce the
@@ -76,6 +77,14 @@ pub struct AppState {
     /// UI scale factor from config (default 1.0).  Multiplied against
     /// the GTK Xft DPI to adjust for HiDPI / broken environments.
     pub ui_scale: f64,
+
+    /// Followed series (persisted to follows.json), shown in the sidebar
+    /// and optionally merged into the inbox view.
+    pub follows: RefCell<Vec<Follow>>,
+
+    /// Whether the currently active view is the inbox (so follow changes
+    /// can re-run it).
+    active_is_inbox: Cell<bool>,
 }
 
 impl AppState {
@@ -114,7 +123,98 @@ impl AppState {
             has_on_send: init.has_on_send,
             theme: init.theme,
             ui_scale: init.ui_scale,
+            follows: RefCell::new(lorebird_core::follows::load()),
+            active_is_inbox: Cell::new(false),
         }
+    }
+
+    /// Add a followed series and persist.
+    pub fn add_follow(&self, follow: Follow) {
+        self.follows.borrow_mut().push(follow);
+        if let Err(e) = lorebird_core::follows::save(&self.follows.borrow()) {
+            eprintln!("[lorebird] could not save follows: {}", e);
+        }
+    }
+
+    /// Remove the followed series with the given query and persist.
+    pub fn remove_follow(&self, query: &str) {
+        self.follows.borrow_mut().retain(|f| f.query != query);
+        if let Err(e) = lorebird_core::follows::save(&self.follows.borrow()) {
+            eprintln!("[lorebird] could not save follows: {}", e);
+        }
+    }
+
+    /// Archive the entire series of `subject` (all editions). Returns the
+    /// number of newly archived messages.
+    pub fn archive_series(&self, subject: &str) -> Result<usize, String> {
+        let key = lorebird_core::series::series_key(subject);
+        if key.is_empty() {
+            return Err("could not derive a series from this subject".to_string());
+        }
+        let db = self.db.borrow();
+        let conn = db.as_ref().ok_or("no index open")?;
+        lorebird_core::archive::archive_series(conn, &key).map_err(|e| e.to_string())
+    }
+
+    /// Unarchive the entire series of `subject`. Returns the number removed.
+    pub fn unarchive_series(&self, subject: &str) -> Result<usize, String> {
+        let key = lorebird_core::series::series_key(subject);
+        if key.is_empty() {
+            return Err("could not derive a series from this subject".to_string());
+        }
+        let db = self.db.borrow();
+        let conn = db.as_ref().ok_or("no index open")?;
+        lorebird_core::archive::unarchive_series(conn, &key).map_err(|e| e.to_string())
+    }
+
+    /// Re-dispatch the currently active view/search so the list reflects a
+    /// change (e.g. after archiving). Falls back to All Mail.
+    pub fn rerun_active_view(&self) -> Result<(), String> {
+        let q = self.active_query.borrow().clone();
+        match q {
+            Some(q) => self.request_search(q, PendingDesc::Search),
+            None => self.request_load_all(PendingDesc::ShowAll),
+        }
+    }
+
+    /// Whether `query` is already followed.
+    pub fn is_followed(&self, query: &str) -> bool {
+        self.follows.borrow().iter().any(|f| f.query == query)
+    }
+
+    /// OR the inbox-flagged follows into a base inbox query.
+    pub fn augment_inbox_query(&self, base: &str) -> String {
+        let extra: Vec<String> = self
+            .follows
+            .borrow()
+            .iter()
+            .filter(|f| f.in_inbox)
+            .map(|f| format!("({})", f.query))
+            .collect();
+        if extra.is_empty() {
+            base.to_string()
+        } else {
+            format!("({}) OR {}", base, extra.join(" OR "))
+        }
+    }
+
+    pub fn set_active_is_inbox(&self, v: bool) {
+        self.active_is_inbox.set(v);
+    }
+
+    pub fn active_is_inbox(&self) -> bool {
+        self.active_is_inbox.get()
+    }
+
+    /// The base query of the inbox view in the active profile, if any.
+    pub fn inbox_base_query(&self) -> Option<String> {
+        let profile = self.active_profile.borrow().clone();
+        let profile = self.profiles.get(&profile)?;
+        profile
+            .views
+            .iter()
+            .find(|v| v.inbox)
+            .map(|v| v.query.clone())
     }
 
     /// Select a profile by label.

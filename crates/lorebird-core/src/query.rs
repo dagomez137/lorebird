@@ -199,6 +199,7 @@ pub fn search(conn: &Connection, query: &ParsedQuery) -> SqlResult<Vec<String>> 
             let mut stmt = conn.prepare(
                 "SELECT message_id FROM mail_ndx
                  WHERE received_ts >= ?1 AND received_ts <= ?2
+                   AND message_id NOT IN (SELECT message_id FROM archived)
                  ORDER BY received_ts DESC LIMIT ?3",
             )?;
             return stmt
@@ -211,6 +212,7 @@ pub fn search(conn: &Connection, query: &ParsedQuery) -> SqlResult<Vec<String>> 
              JOIN mail_ndx n USING (message_id)
              WHERE mail_fts MATCH ?1
                AND n.received_ts >= ?2 AND n.received_ts <= ?3
+               AND f.message_id NOT IN (SELECT message_id FROM archived)
              ORDER BY n.received_ts DESC
              LIMIT ?4",
         )?;
@@ -225,7 +227,9 @@ pub fn search(conn: &Connection, query: &ParsedQuery) -> SqlResult<Vec<String>> 
     // ── no date filter ──
     if query.fts5.is_empty() {
         let mut stmt = conn.prepare(
-            "SELECT message_id FROM mail_ndx ORDER BY received_ts DESC LIMIT ?1",
+            "SELECT message_id FROM mail_ndx
+             WHERE message_id NOT IN (SELECT message_id FROM archived)
+             ORDER BY received_ts DESC LIMIT ?1",
         )?;
         return stmt
             .query_map(params![query.limit], |r| r.get(0))?
@@ -233,7 +237,10 @@ pub fn search(conn: &Connection, query: &ParsedQuery) -> SqlResult<Vec<String>> 
     }
 
     let mut stmt = conn.prepare(
-        "SELECT message_id FROM mail_fts WHERE mail_fts MATCH ?1 LIMIT ?2",
+        "SELECT message_id FROM mail_fts
+         WHERE mail_fts MATCH ?1
+           AND message_id NOT IN (SELECT message_id FROM archived)
+         LIMIT ?2",
     )?;
     stmt.query_map(params![&query.fts5, query.limit], |r| r.get(0))?
         .collect::<SqlResult<Vec<String>>>()

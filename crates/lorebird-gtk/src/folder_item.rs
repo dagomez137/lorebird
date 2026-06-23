@@ -30,6 +30,10 @@ mod imp {
         /// Row kind, stored as the string representation of [`FolderKind`].
         #[property(get, set)]
         row_kind: RefCell<String>,
+        /// True for the inbox view — followed series flagged "add to inbox"
+        /// are merged into its query at runtime.
+        #[property(get, set)]
+        is_inbox: Cell<bool>,
     }
 
     #[glib::object_subclass]
@@ -54,6 +58,10 @@ pub enum FolderKind {
     AllMail,
     Drafts,
     View,
+    /// The "Followed" section header (non-selectable).
+    FollowHeader,
+    /// A followed-series row (behaves like a view).
+    Follow,
     Separator,
     Placeholder,
 }
@@ -66,6 +74,8 @@ impl FolderKind {
             Self::AllMail => "all-mail",
             Self::Drafts => "drafts",
             Self::View => "view",
+            Self::FollowHeader => "follow-header",
+            Self::Follow => "follow",
             Self::Separator => "separator",
             Self::Placeholder => "placeholder",
         }
@@ -79,6 +89,8 @@ impl FolderKind {
             "all-mail" => Some(Self::AllMail),
             "drafts" => Some(Self::Drafts),
             "view" => Some(Self::View),
+            "follow-header" => Some(Self::FollowHeader),
+            "follow" => Some(Self::Follow),
             "separator" => Some(Self::Separator),
             "placeholder" => Some(Self::Placeholder),
             _ => None,
@@ -127,7 +139,7 @@ impl FolderItem {
     }
 
     /// Create a saved view row under a profile.
-    pub fn view(profile_label: &str, view_label: &str, query: &str) -> Self {
+    pub fn view(profile_label: &str, view_label: &str, query: &str, is_inbox: bool) -> Self {
         glib::Object::builder()
             .property("name", view_label)
             .property("icon-name", "folder-saved-search")
@@ -136,6 +148,34 @@ impl FolderItem {
             .property("profile-label", profile_label)
             .property("query", query)
             .property("row-kind", FolderKind::View.as_str())
+            .property("is-inbox", is_inbox)
+            .build()
+    }
+
+    /// Create the "Followed" section header (non-selectable).
+    pub fn follow_header() -> Self {
+        glib::Object::builder()
+            .property("name", "Followed")
+            .property("icon-name", "starred-symbolic")
+            .property("count", 0u32)
+            .property("is-header", true)
+            .property("profile-label", "")
+            .property("query", "")
+            .property("row-kind", FolderKind::FollowHeader.as_str())
+            .build()
+    }
+
+    /// Create a followed-series row. Behaves like a view, run against the
+    /// given profile's maildir.
+    pub fn follow(profile_label: &str, label: &str, query: &str) -> Self {
+        glib::Object::builder()
+            .property("name", label)
+            .property("icon-name", "non-starred-symbolic")
+            .property("count", 0u32)
+            .property("is-header", false)
+            .property("profile-label", profile_label)
+            .property("query", query)
+            .property("row-kind", FolderKind::Follow.as_str())
             .build()
     }
 

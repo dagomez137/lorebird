@@ -40,6 +40,12 @@ pub fn init_db(conn: &Connection) -> SqlResult<()> {
             list_id,    -- from List-Id: header, for per-list views
             body
         );
+
+        -- archived message ids: hidden from filtered views (inbox, follows,
+        -- saved searches) but still shown in All Mail.
+        CREATE TABLE IF NOT EXISTS archived (
+            message_id TEXT PRIMARY KEY
+        );
         ",
     )?;
 

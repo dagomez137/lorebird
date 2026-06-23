@@ -31,6 +31,10 @@ pub struct UserInfo {
 pub struct ViewConfig {
     pub label: String,
     pub query: String,
+    /// When true, followed series marked "add to inbox" are OR-ed into this
+    /// view's query at runtime. Set on the profile's inbox view.
+    #[serde(default)]
+    pub inbox: bool,
 }
 
 /// Per-profile data (deserialisable from Lua, **excludes** hooks).
@@ -177,6 +181,7 @@ mod tests {
             views: vec![ViewConfig {
                 label: "patches".to_string(),
                 query: "subject:[PATCH]".to_string(),
+                inbox: false,
             }],
             smtp: None,
         };
@@ -261,6 +266,7 @@ mod tests {
                         views: vec![ViewConfig {
                             label: "inbox".to_string(),
                             query: "date:1w..".to_string(),
+                            inbox: false,
                         }],
                         smtp: None,
                     },
