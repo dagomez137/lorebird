@@ -208,25 +208,30 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     });
 
     // ── Persistent query poller ──────────────────────────────────
-    // The background query worker (profile switches, views, search,
-    // post-fetch rebuilds) delivers `PlainNode` trees here.  This single
-    // poller applies current results to the list, discards stale ones,
-    // updates the status bar, stops the spinner, and scrolls to the top.
+    // The background query worker delivers `PlainNode` trees here in
+    // batches (newest-first). This poller applies current batches, discards
+    // stale ones, and updates the status bar. On the first batch it scrolls
+    // to the top so the newest mail is visible immediately; the spinner
+    // keeps running until the final batch arrives.
     let state_for_qpoll = state.clone();
     let status_for_qpoll = status_label.clone();
     let spinner_for_qpoll = spinner.clone();
     let column_view_for_qpoll = column_view.clone();
     glib::timeout_add_local(Duration::from_millis(50), move || {
         let s = state_for_qpoll.borrow();
-        let mut applied_current = false;
+        let mut scroll_to_top = false;
         while let Some(result) = s.poll_query_result() {
-            if let Some(status) = s.apply_query_result(&result) {
-                status_for_qpoll.set_text(&status);
-                applied_current = true;
+            if let Some(outcome) = s.apply_query_result(&result) {
+                status_for_qpoll.set_text(&outcome.status);
+                if outcome.first {
+                    scroll_to_top = true;
+                }
+                if outcome.done {
+                    spinner_for_qpoll.set_spinning(false);
+                }
             }
         }
-        if applied_current {
-            spinner_for_qpoll.set_spinning(false);
+        if scroll_to_top {
             let cv = column_view_for_qpoll.clone();
             glib::idle_add_local_once(move || {
                 if let Some(adj) = cv.vadjustment() {

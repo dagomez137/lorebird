@@ -74,6 +74,43 @@ pub fn load_all_messages(conn: &Connection) -> SqlResult<Vec<DbMessage>> {
     rows.collect()
 }
 
+/// Load the most recent `limit` indexed messages from `mail_ndx`,
+/// ordered by `received_ts` descending (newest first).
+///
+/// This relies on the `idx_mail_ndx_received_ts` index so it reads only
+/// `limit` rows rather than scanning the whole table — used by the GTK
+/// query worker to cap its in-memory threading working set on very large
+/// indexes.  The returned order does not matter for JWZ threading (which
+/// is order-independent; siblings are sorted afterward).
+pub fn load_recent_messages(conn: &Connection, limit: usize) -> SqlResult<Vec<DbMessage>> {
+    let mut stmt = conn.prepare(
+        "SELECT message_id, refs, subject, from_addr, date, received_ts, filename
+         FROM mail_ndx
+         ORDER BY received_ts DESC
+         LIMIT ?1",
+    )?;
+
+    let rows = stmt.query_map([limit as i64], |row| {
+        let message_id: Option<String> = row.get(0)?;
+        let refs_str: Option<String> = row.get(1)?;
+        let references: Vec<String> = refs_str
+            .as_deref()
+            .map(|s| s.split_whitespace().map(|w| w.to_string()).collect())
+            .unwrap_or_default();
+        Ok(DbMessage {
+            message_id,
+            references,
+            subject: row.get(2)?,
+            from_addr: row.get(3)?,
+            date: row.get(4)?,
+            received_ts: row.get(5)?,
+            filename: row.get(6)?,
+        })
+    })?;
+
+    rows.collect()
+}
+
 /// Load messages matching a list of message IDs (e.g. from a search).
 ///
 /// Results are ordered by `received_ts` ascending.

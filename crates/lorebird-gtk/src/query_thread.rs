@@ -1,17 +1,19 @@
 //! Background query worker thread.
 //!
-//! The heavy read work — loading every indexed message, JWZ-threading
-//! the whole set, and running search queries — runs here on a dedicated
-//! thread that owns its own read-only SQLite connection.  This keeps the
-//! GTK main thread responsive: profile switches, view clicks, and search
-//! never block the UI.
+//! The heavy read work — loading the recent messages and JWZ-threading them —
+//! runs here on a dedicated thread that owns its own read-only SQLite
+//! connection, keeping the GTK main thread responsive.
 //!
-//! The worker produces a `Send`-able [`PlainNode`] tree built purely from
-//! the indexed `DbMessage` rows (no per-message disk reads).  The main
-//! thread converts those into `ThreadNode` GObjects.  Rich fields
+//! The threaded view is cached per maildir (rebuilt after a re-index) so only
+//! the first query pays the load+thread cost; later view clicks reuse it.
+//! Results are ordered newest-first and streamed to the UI in batches so the
+//! latest threads render immediately on large result sets.
+//!
+//! The worker produces `Send`-able [`PlainNode`] trees built purely from the
+//! indexed `DbMessage` rows (no per-message disk reads). Rich fields
 //! (To/Cc/body) are read lazily from disk when a message is previewed.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::mpsc;
 use std::thread;
@@ -51,6 +53,9 @@ pub enum QueryCommand {
         maildir: std::path::PathBuf,
         query: String,
     },
+    /// Drop the cached threaded view (e.g. after a re-index) so the next
+    /// query rebuilds it from the updated database.
+    InvalidateCache,
     Shutdown,
 }
 
@@ -62,6 +67,11 @@ pub enum QueryResult {
         /// `Some(n)` for a search (number of matched messages),
         /// `None` for a plain load-all.
         match_count: Option<usize>,
+        /// `false` for the first batch (replace the list), `true` for
+        /// subsequent batches (append).
+        append: bool,
+        /// `true` on the final batch of a result.
+        done: bool,
     },
     Error {
         generation: u64,
@@ -126,42 +136,75 @@ impl Drop for QueryThread {
 
 // ── Worker loop ─────────────────────────────────────────────────────
 
+/// Cached, fully-threaded view of one maildir's recent messages.
+struct Cache {
+    maildir: std::path::PathBuf,
+    threads: Vec<Thread<DbMessage>>,
+    index: HashMap<String, usize>,
+}
+
+/// Threads are streamed to the UI in batches of this size so the first
+/// (newest) results render immediately even on a large result set.
+const BATCH_SIZE: usize = 300;
+
+/// How many of the most recent messages are loaded and threaded. Threading
+/// itself is cheap (~tens of ms for 100k); this bounds the row-load time from
+/// the on-disk index (~1s for 50k). Tune up for more history at the cost of a
+/// slower first query. Older mail stays on disk but isn't shown in views.
+const WORKING_SET_LIMIT: usize = 50_000;
+
 fn query_thread_main(cmd_rx: mpsc::Receiver<QueryCommand>, result_tx: mpsc::Sender<QueryResult>) {
-    while let Ok(cmd) = cmd_rx.recv() {
-        let out = match cmd {
-            QueryCommand::Shutdown => break,
-            QueryCommand::LoadAll {
-                generation,
-                maildir,
-            } => match load_all(&maildir) {
-                Ok(roots) => QueryResult::Tree {
-                    generation,
-                    roots,
-                    match_count: None,
-                },
-                Err(message) => QueryResult::Error {
-                    generation,
-                    message,
-                },
-            },
-            QueryCommand::Search {
-                generation,
-                maildir,
-                query,
-            } => match search(&maildir, &query) {
-                Ok((roots, n)) => QueryResult::Tree {
-                    generation,
-                    roots,
-                    match_count: Some(n),
-                },
-                Err(message) => QueryResult::Error {
-                    generation,
-                    message,
-                },
+    let mut cache: Option<Cache> = None;
+    // A command pulled off the channel while streaming a previous result
+    // (so we can abandon stale work and process the newer request).
+    let mut pending: Option<QueryCommand> = None;
+
+    loop {
+        let cmd = match pending.take() {
+            Some(c) => c,
+            None => match cmd_rx.recv() {
+                Ok(c) => c,
+                Err(_) => break, // main thread gone
             },
         };
-        if result_tx.send(out).is_err() {
-            break; // main thread is gone
+
+        match cmd {
+            QueryCommand::Shutdown => break,
+            QueryCommand::InvalidateCache => cache = None,
+            QueryCommand::LoadAll { generation, maildir } => {
+                if let Err(message) = prepare_cache(&mut cache, &maildir) {
+                    let _ = result_tx.send(QueryResult::Error { generation, message });
+                    continue;
+                }
+                let c = cache.as_ref().unwrap();
+                let order = ordered_roots(&c.threads, None);
+                stream_batches(&result_tx, &cmd_rx, &mut pending, generation, &c.threads, &order, None);
+            }
+            QueryCommand::Search { generation, maildir, query } => {
+                let parsed = match lorebird_core::query::parse_query(&query) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let _ = result_tx.send(QueryResult::Error {
+                            generation,
+                            message: format!("bad query '{}': {:?}", query, e),
+                        });
+                        continue;
+                    }
+                };
+                if let Err(message) = prepare_cache(&mut cache, &maildir) {
+                    let _ = result_tx.send(QueryResult::Error { generation, message });
+                    continue;
+                }
+                let c = cache.as_ref().unwrap();
+                match matched_roots(&maildir, &parsed, c) {
+                    Ok((order, match_count)) => stream_batches(
+                        &result_tx, &cmd_rx, &mut pending, generation, &c.threads, &order, Some(match_count),
+                    ),
+                    Err(message) => {
+                        let _ = result_tx.send(QueryResult::Error { generation, message });
+                    }
+                }
+            }
         }
     }
 }
@@ -179,44 +222,103 @@ fn open_ro(maildir: &Path) -> Result<Connection, String> {
     .map_err(|e| format!("cannot open database: {}", e))
 }
 
-fn load_all(maildir: &Path) -> Result<Vec<PlainNode>, String> {
-    let conn = open_ro(maildir)?;
-    let messages = lorebird_core::store::load_all_messages(&conn)
-        .map_err(|e| format!("query failed: {}", e))?;
-    let threads = lorebird_core::thread::thread_messages(messages);
-    Ok(threads.iter().map(build_plain).collect())
+/// (Re)build the threaded cache for `maildir` if it isn't already current.
+fn prepare_cache(cache: &mut Option<Cache>, maildir: &Path) -> Result<(), String> {
+    let current = matches!(cache, Some(c) if c.maildir == maildir);
+    if !current {
+        let conn = open_ro(maildir)?;
+        let messages = lorebird_core::store::load_recent_messages(&conn, WORKING_SET_LIMIT)
+            .map_err(|e| format!("query failed: {}", e))?;
+        let threads = lorebird_core::thread::thread_messages(messages);
+        let index = lorebird_core::thread::build_thread_index(&threads);
+        *cache = Some(Cache { maildir: maildir.to_path_buf(), threads, index });
+    }
+    Ok(())
 }
 
-fn search(maildir: &Path, query: &str) -> Result<(Vec<PlainNode>, usize), String> {
-    let parsed = lorebird_core::query::parse_query(query)
-        .map_err(|e| format!("bad query '{}': {:?}", query, e))?;
-    let pq = lorebird_core::query::ParsedQuery::from_ast(&parsed, 5000);
+/// Newest activity timestamp anywhere in a thread (used for ordering).
+fn thread_latest_ts(t: &Thread<DbMessage>) -> i64 {
+    let mut ts = t.message.as_ref().map(|m| m.received_ts).unwrap_or(i64::MIN);
+    for child in &t.children {
+        ts = ts.max(thread_latest_ts(child));
+    }
+    ts
+}
 
+/// Root thread indices, newest-first. `keep`, when given, restricts to the
+/// threads that contain a matched message.
+fn ordered_roots(threads: &[Thread<DbMessage>], keep: Option<&HashSet<usize>>) -> Vec<usize> {
+    let mut idx: Vec<usize> = (0..threads.len())
+        .filter(|i| keep.is_none_or(|k| k.contains(i)))
+        .collect();
+    idx.sort_by(|&a, &b| thread_latest_ts(&threads[b]).cmp(&thread_latest_ts(&threads[a])));
+    idx
+}
+
+/// Run the FTS search and return matching root indices (newest-first) plus
+/// the number of matched messages.
+fn matched_roots(
+    maildir: &Path,
+    parsed: &lorebird_core::query::Query,
+    cache: &Cache,
+) -> Result<(Vec<usize>, usize), String> {
+    let mq = lorebird_core::query::ParsedQuery::from_ast(parsed, 5000);
     let conn = open_ro(maildir)?;
-    let matched_ids: Vec<String> =
-        lorebird_core::query::search(&conn, &pq).map_err(|e| format!("search failed: {}", e))?;
+    let matched_ids = lorebird_core::query::search(&conn, &mq)
+        .map_err(|e| format!("search failed: {}", e))?;
     let match_count = matched_ids.len();
 
-    let all_messages = lorebird_core::store::load_all_messages(&conn)
-        .map_err(|e| format!("query failed: {}", e))?;
-    let threads = lorebird_core::thread::thread_messages(all_messages);
-
-    let thread_index = lorebird_core::thread::build_thread_index(&threads);
-    let mut seen_threads: HashSet<usize> = HashSet::new();
+    let mut seen: HashSet<usize> = HashSet::new();
     for id in &matched_ids {
-        if let Some(&ndx) = thread_index.get(id) {
-            seen_threads.insert(ndx);
+        if let Some(&ndx) = cache.index.get(id) {
+            seen.insert(ndx);
         }
     }
+    Ok((ordered_roots(&cache.threads, Some(&seen)), match_count))
+}
 
-    let roots: Vec<PlainNode> = threads
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| seen_threads.contains(i))
-        .map(|(_, t)| build_plain(t))
-        .collect();
+/// Build `PlainNode`s for `order` and stream them in batches. Stops early if a
+/// newer command arrives (stashing it in `pending`) since the UI discards
+/// results from superseded generations anyway.
+fn stream_batches(
+    result_tx: &mpsc::Sender<QueryResult>,
+    cmd_rx: &mpsc::Receiver<QueryCommand>,
+    pending: &mut Option<QueryCommand>,
+    generation: u64,
+    threads: &[Thread<DbMessage>],
+    order: &[usize],
+    match_count: Option<usize>,
+) {
+    let total = order.len();
+    if total == 0 {
+        let _ = result_tx.send(QueryResult::Tree {
+            generation, roots: Vec::new(), match_count, append: false, done: true,
+        });
+        return;
+    }
 
-    Ok((roots, match_count))
+    let mut sent = 0;
+    let mut first = true;
+    while sent < total {
+        if let Ok(next) = cmd_rx.try_recv() {
+            *pending = Some(next);
+            return;
+        }
+        let end = (sent + BATCH_SIZE).min(total);
+        let roots: Vec<PlainNode> = order[sent..end]
+            .iter()
+            .map(|&i| build_plain(&threads[i]))
+            .collect();
+        sent = end;
+        let _ = result_tx.send(QueryResult::Tree {
+            generation,
+            roots,
+            match_count,
+            append: !first,
+            done: sent >= total,
+        });
+        first = false;
+    }
 }
 
 // ── PlainNode construction (no disk reads) ──────────────────────────

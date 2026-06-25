@@ -236,10 +236,14 @@ pub fn search(conn: &Connection, query: &ParsedQuery) -> SqlResult<Vec<String>> 
             .collect::<SqlResult<Vec<String>>>();
     }
 
+    // Join mail_ndx so the LIMIT keeps the *newest* matches, not an
+    // arbitrary subset.
     let mut stmt = conn.prepare(
-        "SELECT message_id FROM mail_fts
+        "SELECT f.message_id FROM mail_fts f
+         JOIN mail_ndx n USING (message_id)
          WHERE mail_fts MATCH ?1
-           AND message_id NOT IN (SELECT message_id FROM archived)
+           AND f.message_id NOT IN (SELECT message_id FROM archived)
+         ORDER BY n.received_ts DESC
          LIMIT ?2",
     )?;
     stmt.query_map(params![&query.fts5, query.limit], |r| r.get(0))?

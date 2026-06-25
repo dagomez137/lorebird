@@ -9,6 +9,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use gio::prelude::ListModelExt;
 use gio::ListStore;
 use rusqlite::Connection;
 
@@ -27,6 +28,16 @@ pub enum PendingDesc {
     Search,
     ShowAll,
     Fetch { indexed_count: usize },
+}
+
+/// Outcome of applying one (possibly partial) query result to the list.
+pub struct ApplyOutcome {
+    /// Status-bar text to show.
+    pub status: String,
+    /// True for the first batch (the list was replaced) — scroll to top.
+    pub first: bool,
+    /// True for the final batch — the query is complete.
+    pub done: bool,
 }
 
 /// Central application state, shared between the window and action callbacks.
@@ -280,21 +291,32 @@ impl AppState {
     /// Apply a query result on the main thread.  Stale results (from a
     /// superseded request) are ignored.  Returns `Some(status_text)` when
     /// the result was current and applied, `None` when it was stale.
-    pub fn apply_query_result(&self, result: &QueryResult) -> Option<String> {
+    pub fn apply_query_result(&self, result: &QueryResult) -> Option<ApplyOutcome> {
         if result.generation() != self.query_generation.get() {
             return None;
         }
         let desc = self.pending_desc.borrow().clone();
         match result {
-            QueryResult::Error { message, .. } => Some(format!("Error: {}", message)),
-            QueryResult::Tree {
-                roots, match_count, ..
-            } => {
-                self.root_model.remove_all();
+            QueryResult::Error { message, .. } => Some(ApplyOutcome {
+                status: format!("Error: {}", message),
+                first: true,
+                done: true,
+            }),
+            QueryResult::Tree { roots, match_count, append, done, .. } => {
+                // First batch replaces the list; later batches append, so the
+                // newest results stay visible while the rest stream in.
+                if !append {
+                    self.root_model.remove_all();
+                }
                 for p in roots {
                     self.root_model.append(&build_node_from_plain(p));
                 }
-                Some(format_status(desc.as_ref(), *match_count))
+                let status = if *done {
+                    format_status(desc.as_ref(), *match_count)
+                } else {
+                    format!("Loading\u{2026} {} so far", self.root_model.n_items())
+                };
+                Some(ApplyOutcome { status, first: !append, done: *done })
             }
         }
     }
@@ -394,6 +416,10 @@ impl AppState {
                 // Re-open the main-thread DB to pick up newly-indexed data.
                 *self.db.borrow_mut() = None;
                 self.open_db(&maildir)?;
+
+                // The worker's cached threading is now stale — drop it so the
+                // post-fetch query rebuilds from the updated index.
+                let _ = self.query_thread.send(QueryCommand::InvalidateCache);
 
                 let desc = PendingDesc::Fetch { indexed_count: *indexed_count };
                 let query = self.active_query.borrow().clone();
