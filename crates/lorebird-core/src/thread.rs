@@ -8,7 +8,7 @@
 //! - `Subject` fallback (bare subject, stripped of "Re:", "Fwd:", etc.)
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Minimal data the threading algorithm needs from each message.
 ///
@@ -75,8 +75,17 @@ pub struct Thread<T: Message> {
 
 fn is_ancestor<T>(ancestor_idx: usize, descendant_idx: usize, lst: &[Container<T>]) -> bool {
     let mut cur = lst[descendant_idx].parent;
+    let mut steps = 0usize;
     while let Some(p) = cur {
         if p == ancestor_idx {
+            return true;
+        }
+        // Cycle guard: a valid ancestor chain can't be longer than the number
+        // of containers. Malformed real-world References can form parent
+        // cycles; without this, the walk would loop forever. Treat a cycle as
+        // "is an ancestor" so the caller conservatively refuses to add a link.
+        steps += 1;
+        if steps > lst.len() {
             return true;
         }
         cur = lst[p].parent;
@@ -84,12 +93,21 @@ fn is_ancestor<T>(ancestor_idx: usize, descendant_idx: usize, lst: &[Container<T
     false
 }
 
-fn build_thread_subtree<T: Message>(root_idx: usize, cs: &mut Vec<Container<T>>) -> Vec<Thread<T>> {
+fn build_thread_subtree<T: Message>(
+    root_idx: usize,
+    cs: &mut Vec<Container<T>>,
+    visited: &mut HashSet<usize>,
+) -> Vec<Thread<T>> {
+    // Break any cycle that slipped through: never descend into a container
+    // twice. Without this, a parent/child cycle would recurse forever.
+    if !visited.insert(root_idx) {
+        return vec![];
+    }
     let children: Vec<Thread<T>> = cs[root_idx]
         .children
         .clone()
         .into_iter()
-        .flat_map(|child_idx| build_thread_subtree(child_idx, cs))
+        .flat_map(|child_idx| build_thread_subtree(child_idx, cs, visited))
         .collect();
 
     let msg = cs[root_idx].message.take();
@@ -327,7 +345,14 @@ pub fn thread_messages<T: Message>(messages: impl IntoIterator<Item = T>) -> Vec
         }
         //FINALLY; add LAST element in References (** augmented with In-Reply-To)
         //         as the parent of this message
-        if let Some(actual_parent_idx) = prev {
+        // Set this message's parent to the last reference — but only if doing
+        // so would not create a cycle (skip self-parenting, and skip if this
+        // container is already an ancestor of the proposed parent). The
+        // reference-linking loop above guards itself; this final step must too.
+        if let Some(actual_parent_idx) = prev
+            && actual_parent_idx != c_idx
+            && !is_ancestor(c_idx, actual_parent_idx, &cs)
+        {
             if let Some(parent_idx) = cs[c_idx].parent {
                 // already has a parent - ensure we remove this
                 // container as a child before changing its parent value
@@ -361,9 +386,10 @@ pub fn thread_messages<T: Message>(messages: impl IntoIterator<Item = T>) -> Vec
     //  Removing a container:
     //  remove parent.children ref
     //  re-parent all its children to ITS parent
+    let mut visited: HashSet<usize> = HashSet::new();
     let threads: Vec<Thread<T>> = cs_roots
         .into_iter()
-        .flat_map(|idx| build_thread_subtree(idx, &mut cs))
+        .flat_map(|idx| build_thread_subtree(idx, &mut cs, &mut visited))
         .collect();
 
     // old hierarchy in `cs` is stale - `build_thread_subtree`
@@ -431,6 +457,34 @@ mod tests {
                 ids
             })
             .collect()
+    }
+
+    // ── Cycle safety ─────────────────────────────────────────────
+    #[test]
+    fn cyclic_references_terminate() {
+        // Malformed data: A references B and B references A. Before the cycle
+        // guards this would loop forever in is_ancestor / build_thread_subtree.
+        let msgs = vec![
+            TestMessage { id: "a".into(), refs: vec!["b".into()], subject: "x".into(), received_ts: 1 },
+            TestMessage { id: "b".into(), refs: vec!["a".into()], subject: "x".into(), received_ts: 2 },
+        ];
+        let threads = thread_messages(msgs);
+        // Both messages must appear exactly once across the forest.
+        let mut ids: Vec<String> = collect_ids(&threads).into_iter().flatten().collect();
+        ids.sort();
+        assert_eq!(ids, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn self_reference_terminates() {
+        let msgs = vec![TestMessage {
+            id: "a".into(),
+            refs: vec!["a".into()],
+            subject: "x".into(),
+            received_ts: 1,
+        }];
+        let threads = thread_messages(msgs);
+        assert_eq!(collect_ids(&threads), vec![vec!["a".to_string()]]);
     }
 
     // ── Bare Subject Tests ───────────────────────────────────────
