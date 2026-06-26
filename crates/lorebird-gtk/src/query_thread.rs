@@ -10,8 +10,8 @@
 //! latest threads render immediately on large result sets.
 //!
 //! The worker produces `Send`-able [`PlainNode`] trees built purely from the
-//! indexed `DbMessage` rows (no per-message disk reads). Rich fields
-//! (To/Cc/body) are read lazily from disk when a message is previewed.
+//! indexed `CachedMessage` rows (no per-message disk reads). Rich fields
+//! (body) are read lazily from disk when a message is previewed.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -21,7 +21,7 @@ use std::thread;
 use rusqlite::{Connection, OpenFlags};
 
 use crate::app_state::format_relative_time;
-use lorebird_core::store::DbMessage;
+use lorebird_core::store::CachedMessage;
 use lorebird_core::thread::Thread;
 
 /// Plain, `Send`-able representation of a thread node produced by the
@@ -139,8 +139,12 @@ impl Drop for QueryThread {
 /// Cached, fully-threaded view of one maildir's recent messages.
 struct Cache {
     maildir: std::path::PathBuf,
-    threads: Vec<Thread<DbMessage>>,
+    threads: Vec<Thread<CachedMessage>>,
     index: HashMap<String, usize>,
+    /// Whether the in-memory filter path is viable for this cache (schema
+    /// migrated and `list_id` populated). When `false`, searches fall back
+    /// to the slow FTS `query::search` path so views still work pre-re-index.
+    fast_path_ok: bool,
 }
 
 /// Threads are streamed to the UI in batches of this size so the first
@@ -227,17 +231,23 @@ fn prepare_cache(cache: &mut Option<Cache>, maildir: &Path) -> Result<(), String
     let current = matches!(cache, Some(c) if c.maildir == maildir);
     if !current {
         let conn = open_ro(maildir)?;
-        let messages = lorebird_core::store::load_recent_messages(&conn, WORKING_SET_LIMIT)
+        let recent = lorebird_core::store::load_recent_cached(&conn, WORKING_SET_LIMIT)
             .map_err(|e| format!("query failed: {}", e))?;
-        let threads = lorebird_core::thread::thread_messages(messages);
+        let fast_path_ok = recent.fast_path_ok;
+        let threads = lorebird_core::thread::thread_messages(recent.messages);
         let index = lorebird_core::thread::build_thread_index(&threads);
-        *cache = Some(Cache { maildir: maildir.to_path_buf(), threads, index });
+        *cache = Some(Cache {
+            maildir: maildir.to_path_buf(),
+            threads,
+            index,
+            fast_path_ok,
+        });
     }
     Ok(())
 }
 
 /// Newest activity timestamp anywhere in a thread (used for ordering).
-fn thread_latest_ts(t: &Thread<DbMessage>) -> i64 {
+fn thread_latest_ts(t: &Thread<CachedMessage>) -> i64 {
     let mut ts = t.message.as_ref().map(|m| m.received_ts).unwrap_or(i64::MIN);
     for child in &t.children {
         ts = ts.max(thread_latest_ts(child));
@@ -247,21 +257,87 @@ fn thread_latest_ts(t: &Thread<DbMessage>) -> i64 {
 
 /// Root thread indices, newest-first. `keep`, when given, restricts to the
 /// threads that contain a matched message.
-fn ordered_roots(threads: &[Thread<DbMessage>], keep: Option<&HashSet<usize>>) -> Vec<usize> {
+///
+/// Uses `sort_by_cached_key` so `thread_latest_ts` (a recursive subtree walk)
+/// is computed once per thread instead of on every comparison.
+fn ordered_roots(threads: &[Thread<CachedMessage>], keep: Option<&HashSet<usize>>) -> Vec<usize> {
     let mut idx: Vec<usize> = (0..threads.len())
         .filter(|i| keep.is_none_or(|k| k.contains(i)))
         .collect();
-    idx.sort_by(|&a, &b| thread_latest_ts(&threads[b]).cmp(&thread_latest_ts(&threads[a])));
+    // Negate the key to get newest-first while keeping the cached-key fast path.
+    idx.sort_by_cached_key(|&i| std::cmp::Reverse(thread_latest_ts(&threads[i])));
     idx
 }
 
-/// Run the FTS search and return matching root indices (newest-first) plus
-/// the number of matched messages.
+/// Collect a cached message's filterable fields for in-memory evaluation.
+fn filter_fields(m: &CachedMessage) -> lorebird_core::query::FilterFields<'_> {
+    lorebird_core::query::FilterFields {
+        subject: m.subject.as_deref(),
+        from: m.from_addr.as_deref(),
+        to: m.to_addr.as_deref(),
+        cc: m.cc_addr.as_deref(),
+        list_id: m.list_id.as_deref(),
+        received_ts: m.received_ts,
+    }
+}
+
+/// Walk a thread subtree, calling `f` for every present message.
+fn for_each_message(t: &Thread<CachedMessage>, f: &mut impl FnMut(&CachedMessage)) {
+    if let Some(m) = t.message.as_ref() {
+        f(m);
+    }
+    for child in &t.children {
+        for_each_message(child, f);
+    }
+}
+
+/// Resolve matching root indices (newest-first) plus the true number of
+/// matched messages.
+///
+/// Fast path (default): evaluate the parsed query against the cached working
+/// set entirely in memory — no per-view-switch FTS. Archived messages are
+/// excluded by membership in a once-loaded id set (All Mail, which doesn't
+/// reach here, still shows archived).
+///
+/// Fallback path: when the cache predates the schema migration / re-index
+/// (`fast_path_ok == false`) or the query needs body text (`b:`/`body:`),
+/// run the original FTS `query::search` so results stay correct, just slow.
 fn matched_roots(
     maildir: &Path,
     parsed: &lorebird_core::query::Query,
     cache: &Cache,
 ) -> Result<(Vec<usize>, usize), String> {
+    let use_fast_path = cache.fast_path_ok && !lorebird_core::query::needs_body(parsed);
+
+    if use_fast_path {
+        let conn = open_ro(maildir)?;
+        let archived = lorebird_core::archive::load_archived_ids(&conn)
+            .map_err(|e| format!("loading archived set failed: {}", e))?;
+
+        let mut seen: HashSet<usize> = HashSet::new();
+        let mut match_count = 0usize;
+        for (i, thread) in cache.threads.iter().enumerate() {
+            let mut thread_has_match = false;
+            for_each_message(thread, &mut |m| {
+                // Exclude archived (filtered views hide them).
+                if let Some(id) = m.message_id.as_deref() {
+                    if archived.contains(id) {
+                        return;
+                    }
+                }
+                if lorebird_core::query::matches(parsed, &filter_fields(m)) {
+                    match_count += 1;
+                    thread_has_match = true;
+                }
+            });
+            if thread_has_match {
+                seen.insert(i);
+            }
+        }
+        return Ok((ordered_roots(&cache.threads, Some(&seen)), match_count));
+    }
+
+    // ── Fallback: FTS search (pre-migration, or body-text query) ──
     let mq = lorebird_core::query::ParsedQuery::from_ast(parsed, 5000);
     let conn = open_ro(maildir)?;
     let matched_ids = lorebird_core::query::search(&conn, &mq)
@@ -285,7 +361,7 @@ fn stream_batches(
     cmd_rx: &mpsc::Receiver<QueryCommand>,
     pending: &mut Option<QueryCommand>,
     generation: u64,
-    threads: &[Thread<DbMessage>],
+    threads: &[Thread<CachedMessage>],
     order: &[usize],
     match_count: Option<usize>,
 ) {
@@ -323,7 +399,7 @@ fn stream_batches(
 
 // ── PlainNode construction (no disk reads) ──────────────────────────
 
-fn build_plain(t: &Thread<DbMessage>) -> PlainNode {
+fn build_plain(t: &Thread<CachedMessage>) -> PlainNode {
     let msg = t.message.as_ref();
 
     // Ghost roots borrow the first real descendant's subject.
@@ -367,7 +443,7 @@ fn build_plain(t: &Thread<DbMessage>) -> PlainNode {
 }
 
 /// Most recent timestamp in a subtree.
-fn max_ts(t: &Thread<DbMessage>) -> i64 {
+fn max_ts(t: &Thread<CachedMessage>) -> i64 {
     let own = t.message.as_ref().map(|m| m.received_ts).unwrap_or(0);
     t.children
         .iter()
@@ -375,7 +451,7 @@ fn max_ts(t: &Thread<DbMessage>) -> i64 {
 }
 
 /// Earliest message timestamp in a subtree, if any message is present.
-fn min_ts(t: &Thread<DbMessage>) -> Option<i64> {
+fn min_ts(t: &Thread<CachedMessage>) -> Option<i64> {
     let own = t.message.as_ref().map(|m| m.received_ts);
     let child_min = t.children.iter().filter_map(min_ts).min();
     match (own, child_min) {
@@ -385,7 +461,7 @@ fn min_ts(t: &Thread<DbMessage>) -> Option<i64> {
 }
 
 /// Subject of the first message found in a subtree (depth-first).
-fn subtree_subject(t: &Thread<DbMessage>) -> Option<String> {
+fn subtree_subject(t: &Thread<CachedMessage>) -> Option<String> {
     if let Some(m) = t.message.as_ref() {
         if let Some(s) = m.subject.as_ref() {
             if !s.is_empty() {

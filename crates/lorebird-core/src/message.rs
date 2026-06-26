@@ -95,6 +95,26 @@ impl MailMessage {
     }
 }
 
+/// Normalise a raw `List-Id` header to its inner list identifier.
+///
+/// `List-Id` headers commonly look like `Linux block <linux-block.vger.kernel.org>`
+/// or `<linux-block.vger.kernel.org>`. The stable, comparable identity is the
+/// part inside the angle brackets. This is the single normalisation point used
+/// both when indexing (`indexer`) and when evaluating queries
+/// (`query::matches`), so equality/contains comparisons stay consistent.
+///
+/// Returns the lowercased inner id, or — if there are no angle brackets — the
+/// trimmed, lowercased input.
+pub fn normalize_list_id(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if let Some(open) = trimmed.find('<') {
+        if let Some(close) = trimmed[open + 1..].find('>') {
+            return trimmed[open + 1..open + 1 + close].trim().to_lowercase();
+        }
+    }
+    trimmed.to_lowercase()
+}
+
 /// Extract the first email address from a mail_parser `Address` enum.
 ///
 /// Returns the address in display form: `"Name <email>"` when a
@@ -243,6 +263,30 @@ mod tests {
         let raw = b"From: a@b.com\r\nMessage-ID: <x@y>\r\n\r\nhi";
         let msg = MailMessage::from_bytes(raw).unwrap();
         assert_eq!(msg.list_id, None);
+    }
+
+    #[test]
+    fn normalize_list_id_with_display_name() {
+        assert_eq!(
+            normalize_list_id("Linux block <linux-block.vger.kernel.org>"),
+            "linux-block.vger.kernel.org"
+        );
+    }
+
+    #[test]
+    fn normalize_list_id_bracketed_only() {
+        assert_eq!(
+            normalize_list_id("<linux-nvme.lists.infradead.org>"),
+            "linux-nvme.lists.infradead.org"
+        );
+    }
+
+    #[test]
+    fn normalize_list_id_bare() {
+        assert_eq!(
+            normalize_list_id("  Linux-Block.VGER.kernel.org "),
+            "linux-block.vger.kernel.org"
+        );
     }
 
     #[test]

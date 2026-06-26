@@ -122,9 +122,19 @@ fn index_maildir_inner(conn: &Connection, maildir_path: &Path) -> SqlResult<usiz
                 msg.received_ts
             };
 
+            // Normalise List-Id to its inner id (e.g. `linux-block.vger.kernel.org`)
+            // so the in-memory query evaluator can do clean equality/contains
+            // comparisons. Same normalisation is applied on the query side.
+            let list_id_ndx = msg
+                .list_id
+                .as_deref()
+                .map(crate::message::normalize_list_id);
+
             // ── mail_ndx (INSERT OR IGNORE — filename UNIQUE catches dupes) ──
+            // to_addr/cc_addr/list_id are stored here too (not just in mail_fts)
+            // so the GTK worker can filter its cached working set in memory.
             let ndx_changes = conn.execute(
-                "INSERT OR IGNORE INTO mail_ndx (message_id, refs, subject, from_addr, date, received_ts, filename)\n                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT OR IGNORE INTO mail_ndx (message_id, refs, subject, from_addr, date, received_ts, filename, list_id, to_addr, cc_addr)\n                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     msg_id,
                     refs,
@@ -133,6 +143,9 @@ fn index_maildir_inner(conn: &Connection, maildir_path: &Path) -> SqlResult<usiz
                     msg.date_rfc3339,
                     effective_ts,
                     rel_path,
+                    list_id_ndx,
+                    msg.to_addr,
+                    msg.cc_addr,
                 ],
             )?;
 

@@ -32,6 +32,21 @@ pub fn archive_series(conn: &Connection, series_key: &str) -> SqlResult<usize> {
     )
 }
 
+/// Load the full set of archived message ids.
+///
+/// The `archived` table is small (only explicitly archived series), so the
+/// in-memory query path loads it once and excludes matches by membership —
+/// cheaper and equivalent to the `NOT IN (SELECT ... FROM archived)` SQL.
+pub fn load_archived_ids(conn: &Connection) -> SqlResult<std::collections::HashSet<String>> {
+    let mut stmt = conn.prepare("SELECT message_id FROM archived")?;
+    let ids = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    let mut set = std::collections::HashSet::new();
+    for id in ids {
+        set.insert(id?);
+    }
+    Ok(set)
+}
+
 /// Unarchive every message whose subject matches `series_key`.
 ///
 /// Returns the number of messages removed from the archive.

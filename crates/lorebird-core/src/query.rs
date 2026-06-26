@@ -67,8 +67,10 @@ impl DateRange {
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
-        let start = self.start_secs.map(|s| now - s).unwrap_or(0);
-        let end = self.end_secs.map(|e| now - e).unwrap_or(now);
+        // Saturating, then floored at 0: a clamped offset of i64::MAX means
+        // "beginning of time" (Unix epoch), not a negative timestamp.
+        let start = self.start_secs.map(|s| now.saturating_sub(s).max(0)).unwrap_or(0);
+        let end = self.end_secs.map(|e| now.saturating_sub(e).max(0)).unwrap_or(now);
         (start.min(end), start.max(end))
     }
 }
@@ -166,6 +168,115 @@ impl ParsedQuery {
                 (format!("NOT ({})", inner), dr)
             }
         }
+    }
+}
+
+// ── In-memory query evaluator ──────────────────────────────────────────
+
+/// The subset of message fields the in-memory evaluator can filter on.
+///
+/// These come from `mail_ndx` (after the schema migration). Body text is
+/// deliberately absent — it lives only in `mail_fts` and is not cached, so
+/// `b:`/`body:` terms and bare words that would need the body are NOT
+/// covered by this path (see [`matches`]).
+pub struct FilterFields<'a> {
+    pub subject: Option<&'a str>,
+    pub from: Option<&'a str>,
+    pub to: Option<&'a str>,
+    pub cc: Option<&'a str>,
+    /// Already-normalised inner list id (e.g. `linux-block.vger.kernel.org`).
+    pub list_id: Option<&'a str>,
+    pub received_ts: i64,
+}
+
+/// Case-insensitive substring test (`needle` already lowercased by caller).
+fn contains_ci(haystack: Option<&str>, needle_lower: &str) -> bool {
+    match haystack {
+        Some(h) => h.to_lowercase().contains(needle_lower),
+        None => false,
+    }
+}
+
+/// Evaluate a parsed [`Query`] AST against a single cached message in memory.
+///
+/// Semantics (case-insensitive substring/token match — it need not perfectly
+/// mirror FTS5 tokenisation):
+/// - `l:`/`list:` → `list_id` contains the (normalised) value
+/// - `f:`/`from:` → `from`
+/// - `to:` / `cc:` → respective field
+/// - `a:`/`addr:` → `from` OR `to` OR `cc`
+/// - `s:`/`subject:` → `subject`
+/// - bare `Word`/`Phrase` → match across subject/from/to/cc/list_id
+/// - `Date` → `received_ts` within the resolved range
+/// - `And`/`Or`/`Not` → recurse
+///
+/// Body-only terms (`b:`/`body:`) cannot be satisfied from the cache; they
+/// evaluate to `false` here. Callers that need body matching must use the
+/// FTS [`search`] path. An unknown field prefix is treated like a bare word.
+pub fn matches(query: &Query, msg: &FilterFields) -> bool {
+    match query {
+        Query::Field { prefix, value } => {
+            let needle = normalize_field_value(prefix, value);
+            match prefix.to_lowercase().as_str() {
+                "l" | "list" => contains_ci(msg.list_id, &needle),
+                "f" | "from" => contains_ci(msg.from, &needle),
+                "to" => contains_ci(msg.to, &needle),
+                "cc" => contains_ci(msg.cc, &needle),
+                "a" | "addr" => {
+                    contains_ci(msg.from, &needle)
+                        || contains_ci(msg.to, &needle)
+                        || contains_ci(msg.cc, &needle)
+                }
+                "s" | "subject" => contains_ci(msg.subject, &needle),
+                // Body is not cached → can't be satisfied here.
+                "b" | "body" => false,
+                // Unknown prefix → search across the available text fields.
+                _ => matches_any_text(msg, &needle),
+            }
+        }
+        Query::Phrase(s) => matches_any_text(msg, &s.to_lowercase()),
+        Query::Word(w) => matches_any_text(msg, &w.to_lowercase()),
+        Query::Date(range) => {
+            let (start, end) = range.resolve();
+            msg.received_ts >= start && msg.received_ts <= end
+        }
+        Query::And(a, b) => matches(a, msg) && matches(b, msg),
+        Query::Or(a, b) => matches(a, msg) || matches(b, msg),
+        Query::Not(a) => !matches(a, msg),
+    }
+}
+
+/// Normalise a field value for comparison. `list` values are run through the
+/// same `List-Id` normalisation used at index time, so e.g. a user typing
+/// `l:Linux block <linux-block.vger.kernel.org>` still matches.
+fn normalize_field_value(prefix: &str, value: &str) -> String {
+    match prefix.to_lowercase().as_str() {
+        "l" | "list" => crate::message::normalize_list_id(value),
+        _ => value.to_lowercase(),
+    }
+}
+
+/// Match a needle across every available text field.
+fn matches_any_text(msg: &FilterFields, needle_lower: &str) -> bool {
+    contains_ci(msg.subject, needle_lower)
+        || contains_ci(msg.from, needle_lower)
+        || contains_ci(msg.to, needle_lower)
+        || contains_ci(msg.cc, needle_lower)
+        || contains_ci(msg.list_id, needle_lower)
+}
+
+/// Whether evaluating `query` in memory would require the message body
+/// (which the cache does not hold). When `true`, the caller must use the
+/// FTS [`search`] path to get correct results.
+///
+/// A bare `Word`/`Phrase` is matched against the cached text fields here, so
+/// it does NOT force the FTS path — only explicit `b:`/`body:` terms do.
+pub fn needs_body(query: &Query) -> bool {
+    match query {
+        Query::Field { prefix, .. } => matches!(prefix.to_lowercase().as_str(), "b" | "body"),
+        Query::And(a, b) | Query::Or(a, b) => needs_body(a) || needs_body(b),
+        Query::Not(a) => needs_body(a),
+        Query::Phrase(_) | Query::Word(_) | Query::Date(_) => false,
     }
 }
 
@@ -279,9 +390,31 @@ fn quoted_phrase(input: &str) -> IResult<&str, Query> {
 
 // ── date-range parsers ─────────────────────────────────────────────────
 
-/// Parse a non-negative integer.
+/// Parse a non-negative integer used as a date offset multiplier.
+///
+/// The digit count is capped (an offset never needs more than this many
+/// digits — `9` digits is already ~270 years in seconds when multiplied by
+/// the largest unit) so an absurdly long run of digits can't overflow `i64`
+/// in the later `n * unit` step and panic the worker thread in debug builds.
 fn date_number(input: &str) -> IResult<&str, i64> {
-    map_res(digit1, |s: &str| s.parse::<i64>())(input)
+    map_res(digit1, |s: &str| {
+        // Clamp to a sane magnitude; saturating arithmetic downstream also
+        // guards the multiply, but capping here keeps parses well-formed.
+        if s.len() > MAX_DATE_DIGITS {
+            return Ok::<i64, std::num::ParseIntError>(i64::MAX);
+        }
+        Ok(s.parse::<i64>().unwrap_or(i64::MAX))
+    })(input)
+}
+
+/// Maximum digits accepted for a date offset before it is clamped.
+const MAX_DATE_DIGITS: usize = 9;
+
+/// Multiply an offset count by a unit-in-seconds without overflowing.
+/// Saturates at `i64::MAX` so a huge `date:99999999999y..` clamps to "all
+/// time" rather than panicking on the worker thread.
+fn offset_secs(n: i64, unit: i64) -> i64 {
+    n.checked_mul(unit).unwrap_or(i64::MAX)
 }
 
 /// Parse a time unit, returning the equivalent in seconds.
@@ -301,7 +434,7 @@ fn date_open_start(input: &str) -> IResult<&str, DateRange> {
     let (rest, n) = date_number(input)?;
     let (rest, unit) = date_unit(rest)?;
     let (rest, _) = tag("..")(rest)?;
-    Ok((rest, DateRange { start_secs: Some(n * unit), end_secs: None }))
+    Ok((rest, DateRange { start_secs: Some(offset_secs(n, unit)), end_secs: None }))
 }
 
 /// `..N<unit>`
@@ -309,7 +442,7 @@ fn date_open_end(input: &str) -> IResult<&str, DateRange> {
     let (rest, _) = tag("..")(input)?;
     let (rest, n) = date_number(rest)?;
     let (rest, unit) = date_unit(rest)?;
-    Ok((rest, DateRange { start_secs: None, end_secs: Some(n * unit) }))
+    Ok((rest, DateRange { start_secs: None, end_secs: Some(offset_secs(n, unit)) }))
 }
 
 /// `N1<unit>..N2<unit>`
@@ -319,8 +452,8 @@ fn date_bounded(input: &str) -> IResult<&str, DateRange> {
     let (rest, _) = tag("..")(rest)?;
     let (rest, n2) = date_number(rest)?;
     let (rest, u2) = date_unit(rest)?;
-    let secs1 = n1 * u1;
-    let secs2 = n2 * u2;
+    let secs1 = offset_secs(n1, u1);
+    let secs2 = offset_secs(n2, u2);
     let older = secs1.max(secs2);
     let newer = secs1.min(secs2);
     Ok((rest, DateRange { start_secs: Some(older), end_secs: Some(newer) }))
@@ -690,6 +823,33 @@ mod tests {
     }
 
     #[test]
+    fn parse_date_huge_offset_does_not_overflow() {
+        // Previously `n * unit` could overflow i64 and panic (debug) on the
+        // worker thread. A long run of digits is clamped, and resolve() must
+        // not panic.
+        let q = parse_query("date:99999999999999999999y..").unwrap();
+        if let Query::Date(range) = q {
+            // Clamped to i64::MAX, resolves to "beginning of time" without panic.
+            let (start, end) = range.resolve();
+            assert!(start <= end);
+            assert_eq!(start, 0);
+        } else {
+            panic!("expected Date");
+        }
+    }
+
+    #[test]
+    fn parse_date_max_unit_no_overflow() {
+        // Largest unit (year) with a 9-digit count must not overflow.
+        let q = parse_query("date:999999999y..").unwrap();
+        if let Query::Date(range) = q {
+            let _ = range.resolve(); // must not panic
+        } else {
+            panic!("expected Date");
+        }
+    }
+
+    #[test]
     fn parse_date_with_other_terms() {
         let q = parse_query("hello AND date:3d..").unwrap();
         assert!(matches!(q, Query::And(..)));
@@ -792,5 +952,135 @@ mod tests {
         let pq = ParsedQuery::from_ast(&q, 50);
         assert_eq!(pq.fts5, "hello*");
         assert!(pq.date_range.is_none());
+    }
+
+    // ── in-memory evaluator ────────────────────────────────────────
+
+    fn sample() -> (String, String, String, String, String) {
+        (
+            "Re: nvme: fix oops".to_string(),
+            "Christoph Hellwig <hch@lst.de>".to_string(),
+            "Jens Axboe <axboe@kernel.dk>".to_string(),
+            "linux-block@vger.kernel.org".to_string(),
+            "linux-block.vger.kernel.org".to_string(),
+        )
+    }
+
+    fn fields<'a>(
+        s: &'a str,
+        f: &'a str,
+        t: &'a str,
+        c: &'a str,
+        l: &'a str,
+        ts: i64,
+    ) -> FilterFields<'a> {
+        FilterFields {
+            subject: Some(s),
+            from: Some(f),
+            to: Some(t),
+            cc: Some(c),
+            list_id: Some(l),
+            received_ts: ts,
+        }
+    }
+
+    #[test]
+    fn matches_list_filter() {
+        let (s, f, t, c, l) = sample();
+        let m = fields(&s, &f, &t, &c, &l, 100);
+        assert!(matches(&parse_query("l:linux-block.vger.kernel.org").unwrap(), &m));
+        // Partial / contains also matches.
+        assert!(matches(&parse_query("list:linux-block").unwrap(), &m));
+        assert!(!matches(&parse_query("l:linux-nvme.lists.infradead.org").unwrap(), &m));
+    }
+
+    #[test]
+    fn matches_list_filter_normalised_value() {
+        let (s, f, t, c, l) = sample();
+        let m = fields(&s, &f, &t, &c, &l, 100);
+        // User pastes the full raw List-Id; normalisation strips the brackets.
+        let q = parse_query("l:\"Linux block <linux-block.vger.kernel.org>\"").unwrap();
+        assert!(matches(&q, &m));
+    }
+
+    #[test]
+    fn matches_from_and_addr() {
+        let (s, f, t, c, l) = sample();
+        let m = fields(&s, &f, &t, &c, &l, 100);
+        assert!(matches(&parse_query("from:hch@lst.de").unwrap(), &m));
+        assert!(matches(&parse_query("f:hellwig").unwrap(), &m));
+        // a: spans from/to/cc — axboe is in To.
+        assert!(matches(&parse_query("a:axboe@kernel.dk").unwrap(), &m));
+        assert!(!matches(&parse_query("from:axboe").unwrap(), &m));
+    }
+
+    #[test]
+    fn matches_subject_and_bare_word() {
+        let (s, f, t, c, l) = sample();
+        let m = fields(&s, &f, &t, &c, &l, 100);
+        assert!(matches(&parse_query("s:oops").unwrap(), &m));
+        assert!(matches(&parse_query("subject:\"fix oops\"").unwrap(), &m));
+        // Bare word searches all text fields (here it hits the subject).
+        assert!(matches(&parse_query("nvme").unwrap(), &m));
+        // Bare word also hits the from field.
+        assert!(matches(&parse_query("hellwig").unwrap(), &m));
+        assert!(!matches(&parse_query("nonexistentxyz").unwrap(), &m));
+    }
+
+    #[test]
+    fn matches_date_range() {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let (s, f, t, c, l) = sample();
+        // Message from ~2 days ago.
+        let recent = fields(&s, &f, &t, &c, &l, now - 2 * 86400);
+        let old = fields(&s, &f, &t, &c, &l, now - 30 * 86400);
+        // `date:7d..` → range [now-7d, now] = "within the last 7 days".
+        let within_7d = parse_query("date:7d..").unwrap();
+        assert!(matches(&within_7d, &recent)); // 2d ago is within the last 7d
+        assert!(!matches(&within_7d, &old)); // 30d ago is not
+        // `date:..1w` → range [epoch, now-1w] = "older than a week".
+        let older_than_1w = parse_query("date:..1w").unwrap();
+        assert!(matches(&older_than_1w, &old));
+        assert!(!matches(&older_than_1w, &recent));
+    }
+
+    #[test]
+    fn matches_boolean_and_not() {
+        let (s, f, t, c, l) = sample();
+        let m = fields(&s, &f, &t, &c, &l, 100);
+        assert!(matches(&parse_query("from:hch AND s:oops").unwrap(), &m));
+        assert!(!matches(&parse_query("from:hch AND s:nonexistent").unwrap(), &m));
+        assert!(matches(&parse_query("NOT from:axboe").unwrap(), &m));
+        assert!(matches(&parse_query("from:axboe OR s:oops").unwrap(), &m));
+    }
+
+    #[test]
+    fn matches_body_term_is_false_but_flagged() {
+        let (s, f, t, c, l) = sample();
+        let m = fields(&s, &f, &t, &c, &l, 100);
+        let q = parse_query("b:somebodytext").unwrap();
+        assert!(!matches(&q, &m));
+        assert!(needs_body(&q));
+        assert!(needs_body(&parse_query("from:hch AND body:foo").unwrap()));
+        assert!(!needs_body(&parse_query("from:hch AND s:oops").unwrap()));
+        assert!(!needs_body(&parse_query("plainword").unwrap()));
+    }
+
+    #[test]
+    fn matches_handles_missing_fields() {
+        let m = FilterFields {
+            subject: Some("hello"),
+            from: None,
+            to: None,
+            cc: None,
+            list_id: None,
+            received_ts: 0,
+        };
+        assert!(!matches(&parse_query("l:anything").unwrap(), &m));
+        assert!(!matches(&parse_query("from:anyone").unwrap(), &m));
+        assert!(matches(&parse_query("s:hello").unwrap(), &m));
     }
 }
