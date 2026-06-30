@@ -335,12 +335,12 @@ pub fn thread_messages<T: Message>(messages: impl IntoIterator<Item = T>) -> Vec
             //
             //   If EITHER is reachable from the other, don't add a link
             if let Some(p) = prev
-                && cs[p].parent.is_none()
+                && cs[ref_idx].parent.is_none()
                 && !is_ancestor(p, ref_idx, &cs)
                 && !is_ancestor(ref_idx, p, &cs)
             {
-                cs[p].parent = Some(ref_idx);
-                cs[ref_idx].children.push(p);
+                cs[ref_idx].parent = Some(p);
+                cs[p].children.push(ref_idx);
             }
 
             prev = Some(ref_idx)
@@ -487,6 +487,44 @@ mod tests {
         }];
         let threads = thread_messages(msgs);
         assert_eq!(collect_ids(&threads), vec![vec!["a".to_string()]]);
+    }
+
+    #[test]
+    fn multi_reference_keeps_root_at_top() {
+        // A References header is ordered oldest-first, so an earlier entry is
+        // the ancestor of a later one. The original message ("root") has no
+        // references and must stay the top of the thread even when a later
+        // reply lists it alongside an intermediate parent. Feed newest-first,
+        // the order the query cache loads, to exercise the order-dependent
+        // linking path that previously inverted root and reply.
+        let msgs = vec![
+            TestMessage { id: "leaf".into(), refs: vec!["root".into(), "mid".into()], subject: "Re: x".into(), received_ts: 3 },
+            TestMessage { id: "mid".into(), refs: vec!["root".into()], subject: "Re: x".into(), received_ts: 2 },
+            TestMessage { id: "root".into(), refs: vec![], subject: "x".into(), received_ts: 1 },
+        ];
+        let threads = thread_messages(msgs);
+        // DFS id order alone cannot tell a proper chain from a flat tree where
+        // mid and leaf are both direct children of root, so assert the depth of
+        // each node too: root -> mid -> leaf must nest one level at a time.
+        let mut shape: Vec<(String, usize)> = Vec::new();
+        fn walk<T: Message>(t: &Thread<T>, depth: usize, acc: &mut Vec<(String, usize)>) {
+            if let Some(ref m) = t.message {
+                acc.push((m.message_id().unwrap().to_string(), depth));
+            }
+            for c in &t.children {
+                walk(c, depth + 1, acc);
+            }
+        }
+        assert_eq!(threads.len(), 1);
+        walk(&threads[0], 0, &mut shape);
+        assert_eq!(
+            shape,
+            vec![
+                ("root".to_string(), 0),
+                ("mid".to_string(), 1),
+                ("leaf".to_string(), 2),
+            ]
+        );
     }
 
     // ── Bare Subject Tests ───────────────────────────────────────
