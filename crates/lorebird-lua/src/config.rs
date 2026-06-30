@@ -66,8 +66,22 @@ pub struct AppConfig {
     /// the GTK Xft DPI setting.
     #[serde(default = "default_ui_scale")]
     pub ui_scale: f64,
+    /// Maximum number of recent messages loaded and threaded into the query
+    /// working set. The query worker loads this many newest messages, threads
+    /// them once, and filters views in memory against that cache. A value
+    /// below the maildir's message count leaves older messages unthreaded, so
+    /// replies whose parent falls outside the window show up orphaned; keep it
+    /// above the maildir size. Larger values cost memory and a slower first
+    /// cache build. Defaults to [`DEFAULT_WORKING_SET_LIMIT`].
+    #[serde(default = "default_working_set_limit")]
+    pub working_set_limit: usize,
     pub profiles: HashMap<String, ProfileData>,
 }
+
+/// Default working-set size when `working_set_limit` is unset. Chosen well
+/// above a typical bounded maildir so every message threads, while still
+/// capping a runaway maildir from threading millions of rows in memory.
+pub const DEFAULT_WORKING_SET_LIMIT: usize = 500_000;
 
 fn default_theme() -> String {
     "light".to_string()
@@ -75,6 +89,10 @@ fn default_theme() -> String {
 
 fn default_ui_scale() -> f64 {
     1.0
+}
+
+fn default_working_set_limit() -> usize {
+    DEFAULT_WORKING_SET_LIMIT
 }
 
 // ── Hook types (Lua function handles) ──────────────────────────────
@@ -245,6 +263,7 @@ mod tests {
             }),
             theme: "light".to_string(),
             ui_scale: 1.0,
+            working_set_limit: DEFAULT_WORKING_SET_LIMIT,
             profiles: {
                 let mut m = HashMap::new();
                 m.insert(

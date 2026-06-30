@@ -96,12 +96,12 @@ pub struct QueryThread {
 }
 
 impl QueryThread {
-    pub fn spawn() -> Self {
+    pub fn spawn(working_set_limit: usize) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel::<QueryCommand>();
         let (result_tx, result_rx) = mpsc::channel::<QueryResult>();
         let handle = thread::Builder::new()
             .name("lorebird-query".to_string())
-            .spawn(move || query_thread_main(cmd_rx, result_tx))
+            .spawn(move || query_thread_main(cmd_rx, result_tx, working_set_limit))
             .expect("failed to spawn query thread");
         Self {
             cmd_tx,
@@ -155,9 +155,11 @@ const BATCH_SIZE: usize = 300;
 /// itself is cheap (~tens of ms for 100k); this bounds the row-load time from
 /// the on-disk index (~1s for 50k). Tune up for more history at the cost of a
 /// slower first query. Older mail stays on disk but isn't shown in views.
-const WORKING_SET_LIMIT: usize = 50_000;
-
-fn query_thread_main(cmd_rx: mpsc::Receiver<QueryCommand>, result_tx: mpsc::Sender<QueryResult>) {
+fn query_thread_main(
+    cmd_rx: mpsc::Receiver<QueryCommand>,
+    result_tx: mpsc::Sender<QueryResult>,
+    working_set_limit: usize,
+) {
     let mut cache: Option<Cache> = None;
     // A command pulled off the channel while streaming a previous result
     // (so we can abandon stale work and process the newer request).
@@ -176,7 +178,7 @@ fn query_thread_main(cmd_rx: mpsc::Receiver<QueryCommand>, result_tx: mpsc::Send
             QueryCommand::Shutdown => break,
             QueryCommand::InvalidateCache => cache = None,
             QueryCommand::LoadAll { generation, maildir } => {
-                if let Err(message) = prepare_cache(&mut cache, &maildir) {
+                if let Err(message) = prepare_cache(&mut cache, &maildir, working_set_limit) {
                     let _ = result_tx.send(QueryResult::Error { generation, message });
                     continue;
                 }
@@ -195,7 +197,7 @@ fn query_thread_main(cmd_rx: mpsc::Receiver<QueryCommand>, result_tx: mpsc::Send
                         continue;
                     }
                 };
-                if let Err(message) = prepare_cache(&mut cache, &maildir) {
+                if let Err(message) = prepare_cache(&mut cache, &maildir, working_set_limit) {
                     let _ = result_tx.send(QueryResult::Error { generation, message });
                     continue;
                 }
@@ -227,11 +229,15 @@ fn open_ro(maildir: &Path) -> Result<Connection, String> {
 }
 
 /// (Re)build the threaded cache for `maildir` if it isn't already current.
-fn prepare_cache(cache: &mut Option<Cache>, maildir: &Path) -> Result<(), String> {
+fn prepare_cache(
+    cache: &mut Option<Cache>,
+    maildir: &Path,
+    working_set_limit: usize,
+) -> Result<(), String> {
     let current = matches!(cache, Some(c) if c.maildir == maildir);
     if !current {
         let conn = open_ro(maildir)?;
-        let recent = lorebird_core::store::load_recent_cached(&conn, WORKING_SET_LIMIT)
+        let recent = lorebird_core::store::load_recent_cached(&conn, working_set_limit)
             .map_err(|e| format!("query failed: {}", e))?;
         let fast_path_ok = recent.fast_path_ok;
         let threads = lorebird_core::thread::thread_messages(recent.messages);

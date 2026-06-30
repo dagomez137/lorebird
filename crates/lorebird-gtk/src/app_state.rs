@@ -112,6 +112,7 @@ impl AppState {
                     profiles: HashMap::new(),
                     theme: "light".to_string(),
                     ui_scale: 1.0,
+                    working_set_limit: lorebird_lua::DEFAULT_WORKING_SET_LIMIT,
                     has_on_reply: false,
                     has_on_send: false,
                 }
@@ -126,7 +127,7 @@ impl AppState {
             active_maildir: RefCell::new(PathBuf::new()),
             active_query: RefCell::new(None),
             lua_thread,
-            query_thread: QueryThread::spawn(),
+            query_thread: QueryThread::spawn(init.working_set_limit),
             query_generation: Cell::new(0),
             pending_desc: RefCell::new(None),
             profiles: init.profiles,

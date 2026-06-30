@@ -8,8 +8,8 @@
 mod config;
 
 pub use config::{
-    AppConfig, GlobalHooks, LoadedConfig, ProfileData, ProfileHooks, ResolvedProfile, UserInfo,
-    ViewConfig,
+    AppConfig, DEFAULT_WORKING_SET_LIMIT, GlobalHooks, LoadedConfig, ProfileData, ProfileHooks,
+    ResolvedProfile, UserInfo, ViewConfig,
 };
 pub use lorebird_core::compose::Mail;
 pub use lorebird_sendmail::{SendError, SmtpConfig};
