@@ -1196,6 +1196,7 @@ dependencies = [
 name = "lorebird-lorefetch"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "flate2",
  "mail-parser",
  "serde",

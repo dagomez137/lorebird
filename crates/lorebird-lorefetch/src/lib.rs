@@ -25,8 +25,9 @@
 //! newest `Date:` already seen.
 //!
 //! Incremental fetches use per-query `last_date` tracking: on
-//! subsequent fetches for the same query, a `dt:` range is injected
-//! to only pull new mail (with a 1-day overlap for safety).
+//! subsequent fetches for the same query, the configured `rt:` window's
+//! lower bound is rewritten to a dashed-ISO cutoff (with a 1-day overlap
+//! for safety) to only pull recent mail.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
@@ -334,9 +335,23 @@ fn parse_date_string(s: &str) -> Option<String> {
         }
     }
     match (year, month, day) {
-        (Some(y), Some(m), Some(d)) => Some(format!("{:04}-{:02}-{:02}", y, m, d)),
+        (Some(y), Some(m), Some(d)) => {
+            let iso = format!("{:04}-{:02}-{:02}", y, m, d);
+            // Reject future dates. A single garbage `Date:` header (e.g. the
+            // observed `2083-05-30`) would otherwise become the query's
+            // `last_date`, poisoning the incremental window so every later
+            // fetch starts from the bogus future cutoff. Compare as ISO
+            // strings (lexicographic == chronological for `YYYY-MM-DD`).
+            if iso > today_iso() { return None; }
+            Some(iso)
+        }
         _ => None,
     }
+}
+
+/// Today's date as `YYYY-MM-DD` in UTC, used to clamp out future `Date:` headers.
+fn today_iso() -> String {
+    chrono::Utc::now().format("%Y-%m-%d").to_string()
 }
 
 /// Byte offset of `prefix` where it begins a query token (start of string or
@@ -362,7 +377,14 @@ fn build_incremental_query(query: &str, last_date: &str) -> String {
     };
     if year == 0 || month == 0 || day == 0 { return query.to_string(); }
     let (y, m, d) = subtract_one_day(year, month, day);
-    let rt_lower = format!("{:04}{:02}{:02}", y, m, d);
+    // Dashed ISO (`YYYY-MM-DD`), NOT compact `YYYYMMDD`. Empirically, lore's
+    // public-inbox Xapian silently DROPS the date filter for a compact absolute
+    // bound (`rt:20251229..` returned the full 9123-message archive of a list
+    // whose 6-month window held only 150 messages) — it parses the bare digits
+    // as a term, not a date. The dashed form `rt:2025-12-29..` is honored and
+    // matches the relative-window count exactly. Quoted (`rt:"…"..`) yields a
+    // 500. See the empirical probe results in the commit that introduced this.
+    let rt_lower = format!("{:04}-{:02}-{:02}", y, m, d);
     // Bound by received time (`rt:`), not sent Date (`dt:`/`d:`): a message can
     // arrive at lore well after the date in its own header, so a `dt:` cutoff
     // silently skips late-arriving mail. Any existing `rt:` clause is rewritten
@@ -641,7 +663,7 @@ fn urlencoding(s: &str) -> String {
 /// Steps:
 ///   1. Create or validate the maildir structure
 ///   2. Load or initialise the cache (including per-query `last_date`)
-///   3. Compute the incremental query (injecting `dt:` if applicable)
+///   3. Compute the incremental query (rewriting the `rt:` lower bound if applicable)
 ///   4. Fetch the response bytes (solving Anubis if needed)
 ///   5. Detect content type from first bytes (gzip vs raw mbox vs HTML)
 ///   6. Stream through GzDecoder → MboxParser → dedup → write
@@ -665,7 +687,7 @@ pub fn fetch_to_maildir(
     // 3. Compute incremental query
     let effective_query = match cache.query_last_date(query) {
         Some(ld) => {
-            if verbose { eprintln!("[lorefetch] Incremental: last_date={}, injecting dt:", ld); }
+            if verbose { eprintln!("[lorefetch] Incremental: last_date={}, rewriting rt: lower bound", ld); }
             build_incremental_query(query, ld)
         }
         None => {
@@ -899,26 +921,59 @@ mod tests {
     fn parse_date_garbage() { assert_eq!(parse_date_string("not a date"), None); }
 
     #[test]
+    fn parse_date_rejects_future() {
+        // A garbage future `Date:` header (the observed real-world value was
+        // 2083-05-30) must NOT be accepted — it would poison the incremental
+        // `last_date`. Any plausible far-future year is rejected.
+        assert_eq!(parse_date_string("Sun, 30 May 2083 12:00:00 +0000"), None);
+        assert_eq!(parse_date_string("01 Jan 2099 00:00:00 +0000"), None);
+    }
+
+    #[test]
+    fn parse_date_accepts_past_and_today() {
+        // A clearly-past date still parses.
+        assert_eq!(parse_date_string("Fri, 06 Jun 2025 14:32:00 +0000"), Some("2025-06-06".into()));
+        // Today (UTC) is accepted (boundary is inclusive: reject strictly > today).
+        let today = today_iso();
+        let rfc = format!("{} 12:00:00 +0000", reformat_iso_to_rfc(&today));
+        assert_eq!(parse_date_string(&rfc), Some(today));
+    }
+
+    // Helper: turn `2026-06-29` into `29 Jun 2026` for building a test header.
+    fn reformat_iso_to_rfc(iso: &str) -> String {
+        const M: [&str; 12] = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+        let p: Vec<&str> = iso.split('-').collect();
+        let mi: usize = p[1].parse::<usize>().unwrap() - 1;
+        format!("{} {} {}", p[2], M[mi], p[0])
+    }
+
+    #[test]
     fn incremental_no_last_date() {
         assert_eq!(MaildirCache::new().query_last_date("s:lk"), None);
     }
 
     #[test]
     fn incremental_with_last_date() {
-        assert_eq!(build_incremental_query("s:linux-kernel", "2025-06-08"), "s:linux-kernel rt:20250607..");
+        // Emits DASHED ISO (`rt:YYYY-MM-DD..`), which lore honors. The compact
+        // `rt:YYYYMMDD..` form is silently ignored by public-inbox and returns
+        // the full archive — see the comment in build_incremental_query.
+        assert_eq!(build_incremental_query("s:linux-kernel", "2025-06-08"),
+            "s:linux-kernel rt:2025-06-07..");
     }
 
     #[test]
     fn incremental_existing_rt() {
-        assert_eq!(build_incremental_query("s:lk rt:20240101..1.month.ago", "2025-03-15"),
-            "s:lk rt:20250314..1.month.ago");
+        // Rewrites the lower bound to our dashed cutoff, preserves the upper
+        // bound (here a relative `1.month.ago`).
+        assert_eq!(build_incremental_query("s:lk rt:6.weeks.ago..1.month.ago", "2025-03-15"),
+            "s:lk rt:2025-03-14..1.month.ago");
     }
 
     #[test]
     fn incremental_rt_not_substring() {
         // "rt:" inside "support:" must not be mistaken for an rt: clause.
         assert_eq!(build_incremental_query("s:support:foo", "2025-03-15"),
-            "s:support:foo rt:20250314..");
+            "s:support:foo rt:2025-03-14..");
     }
 
     #[test]
