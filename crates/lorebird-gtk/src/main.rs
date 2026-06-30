@@ -4,6 +4,7 @@ mod app_state;
 mod compose;
 mod folder_item;
 mod lua_thread;
+mod platform;
 mod query_thread;
 mod thread_node;
 mod window;
@@ -29,6 +30,9 @@ fn main() {
         // Register our resource path so GTK's icon theme can find our icon
         gtk4::IconTheme::default()
             .add_resource_path("/org/lorebird/app/icons");
+
+        // On macOS, set the Dock / ⌘-Tab icon (no .app bundle when run via cargo).
+        platform::set_app_icon();
 
         // Look for --config <path> on the command line
         let config_path = std::env::args()
