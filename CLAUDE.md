@@ -70,3 +70,31 @@ Field prefixes: `s:`/`subject`, `f:`/`from`, `b:`/`body`, `to:`, `cc:`, `l:`/`li
 ## Conventions
 - Edition 2024, `resolver = "3"`. Match the surrounding code's terse comment style and `// ── section ──` dividers.
 - Mail sending requires an `on_send` hook returning truthy; returning false is treated as a delivery failure. Reply/compose default headers are pre-filled in core and may be modified by the `on_reply` hook.
+- Use long-form command flags everywhere (scripts, docs, commit messages): `mkdir --parents`, `rm --recursive --force`. Use a short flag only when no long form exists, such as `ssh -L`.
+- Avoid the em-dash and en-dash appositive style in all prose, including code comments, docs, and commit messages. Rewrite such constructions as separate sentences, or use a colon, a semicolon, or parentheses instead. Box-drawing dividers in code are fine; this rule is about em and en dashes inside sentences.
+- Distinguish a tool's project name from its command. Name the project in plain text with its canonical spelling (SQLite, GTK, GtkSourceView, Lua, Nix, Xapian, Anubis) and backtick the executable you run (`cargo`, `sqlite3`, `nix`, `lua`). Backtick code identifiers, file paths, query operators (`is:archived`, `l:`, `rt:`), and SQL.
+- Use the modern unified `nix` CLI (`nix build`, `nix develop`, `nix flake check`), never the classic `nix-*` binaries.
+
+## Commit rules
+
+1. One commit per change. Atomic commits only; do not mix unrelated changes, such as a spelling fix with a code change. When in doubt, leave spelling fixes out unless explicitly asked.
+
+2. Write the subject as `subsystem: summary` in the imperative mood, where the subsystem names the area changed: a crate (`core`, `gtk`, `lua`, `lorefetch`, `sendmail`) or a finer area when clearer (`query`, `thread`, `indexer`, `schema`, `series`, `docs`, `build`). Keep the whole subject within 75 characters, following the Linux kernel rule that the summary must be no more than 70 to 75 characters. Aim short; never pad. Do not use conventional-commits prefixes such as `feat:` or `fix:`.
+
+3. Sign off using the git-configured identity. Check it with `git config user.name` and `git config user.email`, then add a `Signed-off-by` trailer.
+
+4. Mark AI-generated work with a `Generated-by: Claude AI` trailer placed immediately before `Signed-off-by`, with no blank line between them:
+
+   ```
+   subsystem: summarise the change in the imperative mood
+
+   Plain-English description of what changed and why, wrapped at 75
+   columns.
+
+   Generated-by: Claude AI
+   Signed-off-by: User Name <user.name@example.org>
+   ```
+
+5. No shopping-cart lists. Write the body as plain-English paragraphs, not bullet points or itemised lists, wrapped at 75 columns (trailers are exempt), focused on helping a reviewer understand the implementation.
+
+6. Before committing, build warning-free and run the tests in the Nix dev shell: `nix develop -c cargo build`, `nix develop -c cargo test`, and `nix develop -c cargo clippy --workspace`. The em/en-dash, long-form-flag, and project-name-versus-command rules above apply to commit messages too.
