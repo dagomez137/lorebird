@@ -13,10 +13,10 @@ use gio::ListStore;
 use glib::Object;
 use gtk4::prelude::*;
 use gtk4::{
-    Align, Application, ApplicationWindow, Box, ColumnView, ColumnViewColumn, CustomSorter, Grid,
-    HeaderBar, IconSize, Image, Label, ListBoxRow, ListItem, Ordering, Orientation, Paned,
-    PolicyType, ScrolledWindow, SearchEntry, SignalListItemFactory, SingleSelection, SortListModel,
-    SortType, Spinner, ToggleButton, TreeExpander, TreeListModel, TreeListRow, WrapMode,
+    Align, Application, ApplicationWindow, Box, CustomSorter, Grid, HeaderBar, IconSize, Image,
+    Label, ListBoxRow, ListItem, ListView, Ordering, Orientation, Paned, PolicyType, ScrolledWindow,
+    SearchEntry, SignalListItemFactory, SingleSelection, SortListModel, Spinner, ToggleButton,
+    TreeExpander, TreeListModel, TreeListRow, WrapMode,
 };
 use sourceview5 as sv;
 use sourceview5::prelude::*;
@@ -137,6 +137,17 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     });
     header.pack_start(&sidebar_toggle);
 
+    // Toggle the per-row metadata line (sender / started / last reply). A
+    // GObject property binding set up in the row factory mirrors this button's
+    // `active` onto every metadata label's `visible`, so realized rows update
+    // live without re-running the factory. Default on.
+    let meta_toggle = ToggleButton::new();
+    meta_toggle.set_icon_name("lorebird-details-symbolic");
+    meta_toggle.set_tooltip_text(Some("Show or hide message details"));
+    meta_toggle.add_css_class("flat");
+    meta_toggle.set_active(true);
+    header.pack_start(&meta_toggle);
+
     // Clones of the sidebar model for live follow/unfollow mutation, and the
     // profile that followed-series rows run against (the first, alphabetically).
     let sidebar_model_for_follow = sidebar_model.clone();
@@ -151,8 +162,13 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     outer_paned.set_shrink_start_child(false);
 
     // Center + preview
-    let (center, selection, column_view, preview_labels, search_entry, expand_guard) =
-        build_center_pane(&state_ref.root_model, is_dark, state_ref.expand_headers);
+    let (center, selection, thread_view, preview_labels, search_entry, expand_guard) =
+        build_center_pane(
+            &state_ref.root_model,
+            is_dark,
+            state_ref.expand_headers,
+            &meta_toggle,
+        );
     let lore_btn = preview_labels.lore_btn.clone();
     inner_paned.set_start_child(Some(&center));
     inner_paned.set_shrink_start_child(false);
@@ -267,7 +283,7 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     let state_for_qpoll = state.clone();
     let status_for_qpoll = status_label.clone();
     let spinner_for_qpoll = spinner.clone();
-    let column_view_for_qpoll = column_view.clone();
+    let column_view_for_qpoll = thread_view.clone();
     glib::timeout_add_local(Duration::from_millis(50), move || {
         let s = state_for_qpoll.borrow();
         let mut scroll_to_top = false;
@@ -300,7 +316,7 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     let active_folder_kind_sidebar = active_folder_kind.clone();
     let selected_node_sidebar = selected_node.clone();
     let reply_btn_sidebar = reply_btn.clone();
-    let column_view_for_sidebar = column_view.clone();
+    let column_view_for_sidebar = thread_view.clone();
     let spinner_for_sidebar = spinner.clone();
     let model = sidebar_model;
     sidebar_lb.connect_row_selected(move |_lb, row| {
@@ -629,7 +645,7 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     // ── Context menu (right-click on thread list) ─────────────────
     let context_menu = gtk4::Popover::new();
     let menu_box = Box::new(Orientation::Vertical, 0);
-    context_menu.set_parent(&column_view);
+    context_menu.set_parent(&thread_view);
     // Follow / Archive / Unarchive buttons (reply / edit-draft / delete-draft
     // are created near the top of the function so the sidebar callback can
     // toggle their sensitivity).
@@ -798,7 +814,7 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
 
     // Right-click gesture on the column view
     let ctx_menu_ref = context_menu.clone();
-    let column_view_for_gesture = column_view.clone();
+    let column_view_for_gesture = thread_view.clone();
     let reply_menu_btn_gesture = reply_menu_btn.clone();
     let edit_draft_btn_gesture = edit_draft_btn.clone();
     let delete_draft_btn_gesture = delete_draft_btn.clone();
@@ -849,7 +865,7 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
         ctx_menu_ref.set_has_arrow(false);
         ctx_menu_ref.popup();
     });
-    column_view.add_controller(gesture);
+    thread_view.add_controller(gesture);
 
     // ── Reply button in header bar ─────────────────────────────────
     let state_for_reply_btn = state.clone();
@@ -967,7 +983,7 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     app.set_accels_for_action("app.focus-search", &["<Ctrl>s"]);
 
     // ── Ctrl+T: focus thread list ──────────────────────────────────
-    let cv_ref = column_view.clone();
+    let cv_ref = thread_view.clone();
     let focus_threads = gtk4::gio::SimpleAction::new("focus-threads", None);
     focus_threads.connect_activate(move |_action, _param| {
         cv_ref.grab_focus();
@@ -1000,7 +1016,7 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
             _ => glib::Propagation::Proceed,
         }
     });
-    column_view.add_controller(key_ctrl);
+    thread_view.add_controller(key_ctrl);
 
     window.present();
 }
@@ -1606,10 +1622,11 @@ fn build_center_pane(
     root_model: &ListStore,
     is_dark: bool,
     expand_headers: bool,
+    meta_toggle: &ToggleButton,
 ) -> (
     Box,
     SingleSelection,
-    ColumnView,
+    ListView,
     PreviewLabels,
     SearchEntry,
     Rc<Cell<bool>>,
@@ -1627,19 +1644,20 @@ fn build_center_pane(
     vbox.append(&search);
 
     // ── Thread list ──────────────────────────────────────────
-    let (column_view, selection, expand_guard) = build_thread_list(root_model);
+    let (thread_view, selection, expand_guard) = build_thread_list(root_model, meta_toggle);
 
     let scrolled = ScrolledWindow::new();
     scrolled.set_vexpand(true);
     scrolled.set_hexpand(true);
-    // Automatic hscroll (never NEVER) keeps the ColumnView's content-driven
+    // Automatic hscroll (never NEVER) keeps the ListView's content-driven
     // minimum from propagating up: a deep thread's fixed TreeExpander indent
-    // or a long subject scrolls inside the list instead of raising the center
-    // pane's minimum and shoving the divider into the reading pane. Not
-    // propagating the natural width keeps the list at its allocated width.
+    // scrolls inside the list instead of raising the center pane's minimum and
+    // shoving the divider into the reading pane. The subject label wraps within
+    // the row width (WordChar), so its minimum stays bounded. Not propagating
+    // the natural width keeps the list at its allocated width.
     scrolled.set_policy(PolicyType::Automatic, PolicyType::Automatic);
     scrolled.set_propagate_natural_width(false);
-    scrolled.set_child(Some(&column_view));
+    scrolled.set_child(Some(&thread_view));
     vbox.append(&scrolled);
 
     // ── Preview labels (updated on selection) ────────────────
@@ -1710,189 +1728,132 @@ fn build_center_pane(
     (
         vbox,
         selection,
-        column_view,
+        thread_view,
         preview_labels,
         search,
         expand_guard,
     )
 }
 
-// ── Thread list (ColumnView + TreeListModel) ──────────────────────
+// ── Thread list (ListView + TreeListModel) ────────────────────────
 
-fn build_thread_list(root_model: &ListStore) -> (ColumnView, SingleSelection, Rc<Cell<bool>>) {
+/// Build the GitLab-issue-style metadata line: sender, then started and
+/// last-reply times. The relative-time strings already carry an " ago"
+/// suffix; trim it here so the muted line reads "started 3w  ·  last 1d".
+fn meta_line(node: &ThreadNode) -> String {
+    let who = sender_display(&node.sender());
+    let started = node.started();
+    let started = started.strip_suffix(" ago").unwrap_or(&started);
+    let last = node.last_reply();
+    let last = last.strip_suffix(" ago").unwrap_or(&last);
+    format!("{who}  \u{00b7}  started {started}  \u{00b7}  last {last}")
+}
+
+fn build_thread_list(
+    root_model: &ListStore,
+    meta_toggle: &ToggleButton,
+) -> (ListView, SingleSelection, Rc<Cell<bool>>) {
     // True during a programmatic recursive expansion, so the per-row
     // `expanded` notify handlers do not launch nested sweeps.
     let expand_guard: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-    // ── Column view (created first to get its composite sorter) ──
-    //
-    // GTK ColumnView sorting works like this:
-    // 1. Each sortable column has a CustomSorter that compares items
-    // 2. ColumnView.get_sorter() returns a composite sorter reflecting
-    //    the column the user last clicked and direction
-    // 3. That composite sorter drives a SortListModel, which keeps
-    //    root-level items in sorted order
-    // 4. TreeListModel wraps SortListModel for expansion
-    let column_view = ColumnView::new(None::<SingleSelection>);
-    column_view.set_vexpand(true);
-    column_view.set_hexpand(true);
 
-    // — Column: Subject (with tree expander) ─────────────────
-    let subject_factory = SignalListItemFactory::new();
-    subject_factory.connect_setup(|_, obj| {
+    // ── Single card-style factory ────────────────────────────
+    // Each row is a TreeExpander (keeps the tree indent and arrows) wrapping a
+    // vertical box: a prominent subject (wrapping to two lines, then ellipsised)
+    // over a muted metadata line. No column headers, so a ListView is the
+    // cleanest fit: the model pipeline (SortListModel → TreeListModel →
+    // SingleSelection) is unchanged, only the sorter now comes from a standalone
+    // CustomSorter instead of a column header.
+    let factory = SignalListItemFactory::new();
+    let toggle_for_setup = meta_toggle.clone();
+    factory.connect_setup(move |_, obj| {
         let list_item = obj.downcast_ref::<ListItem>().unwrap();
         let expander = TreeExpander::new();
-        let label = Label::new(None);
-        label.set_xalign(0.0);
-        label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-        expander.set_child(Some(&label));
+
+        let vbox = Box::new(Orientation::Vertical, 2);
+        vbox.set_hexpand(true);
+        vbox.set_margin_top(2);
+        vbox.set_margin_bottom(2);
+
+        // Subject: full width, wraps to at most two lines, then ellipsises.
+        // WordChar wrap keeps the reported minimum width tiny so the row never
+        // forces horizontal scrolling or shoves the reading-pane divider.
+        let subject = Label::new(None);
+        subject.set_xalign(0.0);
+        subject.set_yalign(0.0);
+        subject.set_hexpand(true);
+        subject.set_wrap(true);
+        subject.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+        subject.set_lines(2);
+        subject.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        vbox.append(&subject);
+
+        // Metadata: one muted, secondary line. Visibility is bound to the
+        // header toggle's `active` here in setup, so the binding lives with the
+        // widget across factory recycling and every realized row updates live.
+        let meta = Label::new(None);
+        meta.set_xalign(0.0);
+        meta.set_yalign(0.0);
+        meta.set_hexpand(true);
+        meta.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        meta.add_css_class("dim-label");
+        meta.add_css_class("caption");
+        toggle_for_setup
+            .bind_property("active", &meta, "visible")
+            .sync_create()
+            .build();
+        vbox.append(&meta);
+
+        expander.set_child(Some(&vbox));
         list_item.set_child(Some(&expander));
     });
+
     let guard_for_bind = expand_guard.clone();
-    subject_factory.connect_bind(move |_, obj| {
+    factory.connect_bind(move |_, obj| {
         let list_item = obj.downcast_ref::<ListItem>().unwrap();
         let row = list_item.item().and_downcast::<TreeListRow>().unwrap();
         let expander = list_item.child().and_downcast::<TreeExpander>().unwrap();
         expander.set_list_row(Some(&row));
         if let Some(node) = row.item().and_downcast::<ThreadNode>() {
-            if let Some(label) = expander.child().and_downcast::<Label>() {
-                label.set_label(&node.subject());
+            if let Some(vbox) = expander.child().and_downcast::<Box>()
+                && let Some(subject) = vbox.first_child().and_downcast::<Label>()
+            {
+                subject.set_label(&node.subject());
+                if let Some(meta) = subject.next_sibling().and_downcast::<Label>() {
+                    meta.set_label(&meta_line(&node));
+                }
             }
+            // Tint the whole row by colouring the expander, which spans the row
+            // (its vbox child hexpands). It must be the expander, never its
+            // parent: the parent is the GtkListItemWidget the list-item manager
+            // owns, and mutating that from inside bind reenters the manager
+            // mid-update and corrupts it.
             install_tint(list_item, &node, &expander);
         }
         // Make a manual arrow/keyboard expansion go full-depth too.
         install_expand(list_item, &row, &guard_for_bind);
     });
-    subject_factory.connect_unbind(|_, obj| {
+    factory.connect_unbind(|_, obj| {
         let list_item = obj.downcast_ref::<ListItem>().unwrap();
         remove_tint(list_item);
         remove_expand(list_item);
     });
 
-    let subject_col = ColumnViewColumn::new(Some("Subject"), Some(subject_factory));
-    subject_col.set_expand(true);
-    column_view.append_column(&subject_col);
-
-    // — Column: From ──────────────────────────────────────────
-    let from_factory = SignalListItemFactory::new();
-    from_factory.connect_setup(|_, obj| {
-        let list_item = obj.downcast_ref::<ListItem>().unwrap();
-        let label = Label::new(None);
-        label.set_xalign(0.0);
-        label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-        // Keep From tight so the Subject column, which holds the tree indent
-        // and truncates first on deep threads, keeps the width.
-        label.set_width_chars(12);
-        label.add_css_class("dim-label");
-        list_item.set_child(Some(&label));
-    });
-    from_factory.connect_bind(|_, obj| {
-        let list_item = obj.downcast_ref::<ListItem>().unwrap();
-        let row = list_item.item().and_downcast::<TreeListRow>().unwrap();
-        if let Some(node) = row.item().and_downcast::<ThreadNode>()
-            && let Some(label) = list_item.child().and_downcast::<Label>()
-        {
-            label.set_label(&node.sender());
-            install_tint(list_item, &node, &label);
-        }
-    });
-    from_factory.connect_unbind(|_, obj| {
-        remove_tint(obj.downcast_ref::<ListItem>().unwrap());
-    });
-
-    let from_col = ColumnViewColumn::new(Some("From"), Some(from_factory));
-    from_col.set_resizable(true);
-    column_view.append_column(&from_col);
-
-    // — Column: Started ──────────────────────────────────────
-    let started_factory = SignalListItemFactory::new();
-    started_factory.connect_setup(|_, obj| {
-        let list_item = obj.downcast_ref::<ListItem>().unwrap();
-        let label = Label::new(None);
-        label.set_xalign(1.0);
-        label.set_width_chars(6);
-        label.add_css_class("dim-label");
-        label.add_css_class("numeric");
-        list_item.set_child(Some(&label));
-    });
-    started_factory.connect_bind(|_, obj| {
-        let list_item = obj.downcast_ref::<ListItem>().unwrap();
-        let row = list_item.item().and_downcast::<TreeListRow>().unwrap();
-        if let Some(node) = row.item().and_downcast::<ThreadNode>()
-            && let Some(label) = list_item.child().and_downcast::<Label>()
-        {
-            label.set_label(&node.started());
-            install_tint(list_item, &node, &label);
-        }
-    });
-    started_factory.connect_unbind(|_, obj| {
-        remove_tint(obj.downcast_ref::<ListItem>().unwrap());
-    });
-
-    // Sorters compare ThreadNode items — ColumnView unwraps
-    // TreeListRow automatically before passing to sorters.
-    let started_sorter = CustomSorter::new(|a, b| {
-        let a_node = a.downcast_ref::<ThreadNode>().unwrap();
-        let b_node = b.downcast_ref::<ThreadNode>().unwrap();
-        match a_node.started_ts().cmp(&b_node.started_ts()) {
-            std::cmp::Ordering::Less => Ordering::Smaller,
-            std::cmp::Ordering::Equal => Ordering::Equal,
-            std::cmp::Ordering::Greater => Ordering::Larger,
-        }
-    });
-
-    let started_col = ColumnViewColumn::new(Some("Started"), Some(started_factory));
-    started_col.set_sorter(Some(&started_sorter));
-    started_col.set_resizable(false);
-    column_view.append_column(&started_col);
-
-    // — Column: Last Reply ─────────────────────────────────
-    let last_reply_factory = SignalListItemFactory::new();
-    last_reply_factory.connect_setup(|_, obj| {
-        let list_item = obj.downcast_ref::<ListItem>().unwrap();
-        let label = Label::new(None);
-        label.set_xalign(1.0);
-        label.set_width_chars(10);
-        label.add_css_class("dim-label");
-        label.add_css_class("numeric");
-        list_item.set_child(Some(&label));
-    });
-    last_reply_factory.connect_bind(|_, obj| {
-        let list_item = obj.downcast_ref::<ListItem>().unwrap();
-        let row = list_item.item().and_downcast::<TreeListRow>().unwrap();
-        if let Some(node) = row.item().and_downcast::<ThreadNode>()
-            && let Some(label) = list_item.child().and_downcast::<Label>()
-        {
-            label.set_label(&node.last_reply());
-            install_tint(list_item, &node, &label);
-        }
-    });
-    last_reply_factory.connect_unbind(|_, obj| {
-        remove_tint(obj.downcast_ref::<ListItem>().unwrap());
-    });
-
+    // ── Model pipeline: SortListModel → TreeListModel → Selection ──
+    //
+    // The column headers (and their click-to-sort) are gone, so a standalone
+    // sorter keeps the root-level threads ordered by last reply, newest first.
     let last_reply_sorter = CustomSorter::new(|a, b| {
         let a_node = a.downcast_ref::<ThreadNode>().unwrap();
         let b_node = b.downcast_ref::<ThreadNode>().unwrap();
-        // Natural ascending order; SortType::Descending reverses to newest-first
-        match a_node.last_reply_ts().cmp(&b_node.last_reply_ts()) {
+        // Reverse the natural order so the newest last-reply sorts first.
+        match b_node.last_reply_ts().cmp(&a_node.last_reply_ts()) {
             std::cmp::Ordering::Less => Ordering::Smaller,
             std::cmp::Ordering::Equal => Ordering::Equal,
             std::cmp::Ordering::Greater => Ordering::Larger,
         }
     });
-
-    let last_reply_col = ColumnViewColumn::new(Some("Last Reply"), Some(last_reply_factory));
-    last_reply_col.set_sorter(Some(&last_reply_sorter));
-    last_reply_col.set_resizable(false);
-    column_view.append_column(&last_reply_col);
-
-    // ── Model pipeline: SortListModel → TreeListModel → Selection ──
-    //
-    // ColumnView.get_sorter() returns a composite sorter that tracks
-    // which column the user clicked and in which direction.  We plug
-    // it into a SortListModel so the root-level items stay sorted.
-    let view_sorter = column_view.sorter().expect("ColumnView must have a sorter");
-    let sorted_model = SortListModel::new(Some(root_model.clone()), Some(view_sorter));
+    let sorted_model = SortListModel::new(Some(root_model.clone()), Some(last_reply_sorter));
 
     let tree_model = TreeListModel::new(
         sorted_model.upcast::<gio::ListModel>(),
@@ -1913,15 +1874,14 @@ fn build_thread_list(root_model: &ListStore) -> (ColumnView, SingleSelection, Rc
     selection.set_can_unselect(true);
     selection.set_autoselect(false);
 
-    column_view.set_model(Some(&selection));
-
-    // Default sort: Last Reply descending (newest first)
-    column_view.sort_by_column(Some(&last_reply_col), SortType::Descending);
+    let list_view = ListView::new(Some(selection.clone()), Some(factory));
+    list_view.set_vexpand(true);
+    list_view.set_hexpand(true);
 
     // Double-click toggles a non-root sub-group; top-level rows belong to the
     // accordion, so skipping them avoids collapsing a just-expanded thread.
-    column_view.connect_activate(move |cv, pos| {
-        if let Some(item) = cv.model().and_then(|m| m.item(pos))
+    list_view.connect_activate(move |lv, pos| {
+        if let Some(item) = lv.model().and_then(|m| m.item(pos))
             && let Some(row) = item.downcast_ref::<TreeListRow>()
             && row.is_expandable()
             && row.parent().is_some()
@@ -1930,7 +1890,7 @@ fn build_thread_list(root_model: &ListStore) -> (ColumnView, SingleSelection, Rc
         }
     });
 
-    (column_view, selection, expand_guard)
+    (list_view, selection, expand_guard)
 }
 
 // ── Whole-thread tint & recursive expansion helpers ───────────────
@@ -1984,13 +1944,15 @@ fn expand_recursive(row: &TreeListRow) {
 }
 
 fn set_thread_tint(widget: &impl glib::object::IsA<gtk4::Widget>, active: bool) {
-    // Tint the cell (the child's parent) so the whole field colours, not just
-    // the text the label paints over its own allocation.
-    let target = widget.parent().unwrap_or_else(|| widget.as_ref().clone());
+    // Tint the passed widget itself. The caller passes the row's own content
+    // widget (the expander), which spans the row. It must not be the
+    // GtkListItemWidget the list-item manager owns: mutating that widget's CSS
+    // from inside the factory bind reenters `ensure_items` while it is updating
+    // the row, which corrupts the manager (GTK_IS_WIDGET assertions, segfault).
     if active {
-        target.add_css_class(THREAD_TINT_CLASS);
+        widget.add_css_class(THREAD_TINT_CLASS);
     } else {
-        target.remove_css_class(THREAD_TINT_CLASS);
+        widget.remove_css_class(THREAD_TINT_CLASS);
     }
 }
 
@@ -2184,6 +2146,21 @@ fn reading_pane_width_px(widget: &impl glib::object::IsA<gtk4::Widget>, columns:
     let metrics = ctx.metrics(Some(&desc), None);
     let char_px = (metrics.approximate_char_width() / gtk4::pango::SCALE).max(7);
     char_px * columns + 96
+}
+
+/// Display name of a From header, dropping the `<address>`. With no name, falls
+/// back to the address local part, so the From column stays short.
+fn sender_display(from: &str) -> String {
+    let from = from.trim();
+    if let Some(i) = from.find('<') {
+        let name = from[..i].trim().trim_matches('"').trim();
+        if !name.is_empty() {
+            return name.to_string();
+        }
+        let addr = from[i + 1..].trim_end_matches('>');
+        return addr.split('@').next().unwrap_or(addr).to_string();
+    }
+    from.split('@').next().unwrap_or(from).to_string()
 }
 
 fn truncate_addr(s: &str) -> String {

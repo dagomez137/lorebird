@@ -1,7 +1,7 @@
 //! GObject model for a thread node in the mail list.
 //!
 //! Each `ThreadNode` represents a single message visible in the
-//! `ColumnView` tree.  Child messages (replies) are stored in a
+//! `ListView` tree.  Child messages (replies) are stored in a
 //! lazily-created `gio::ListStore` so that `TreeListModel` can
 //! discover them.
 //!

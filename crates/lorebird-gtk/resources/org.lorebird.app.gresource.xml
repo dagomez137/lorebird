@@ -13,5 +13,6 @@
   </gresource>
   <gresource prefix="/org/lorebird/app/icons/scalable/actions">
     <file>lorebird-web-symbolic.svg</file>
+    <file>lorebird-details-symbolic.svg</file>
   </gresource>
 </gresources>

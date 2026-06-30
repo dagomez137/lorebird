@@ -48,7 +48,7 @@ pub struct AppState {
     /// Path to the DB's associated maildir (empty = no DB open).
     pub db_maildir: RefCell<PathBuf>,
 
-    /// Root list-store backing the `ColumnView` tree.
+    /// Root list-store backing the `ListView` tree.
     pub root_model: ListStore,
 
     /// The profile label currently active in the sidebar.
