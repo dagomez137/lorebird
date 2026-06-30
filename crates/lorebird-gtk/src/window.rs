@@ -118,13 +118,23 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     // Sidebar (built from config)
     let (sidebar_scrolled, sidebar_model, sidebar_lb) = build_sidebar(&state_ref);
 
+    // Collapse/show the folder sidebar. Uses the same chevron toggle the
+    // To/Cc header expander does (those icons are known to render here).
     let sidebar_toggle = ToggleButton::new();
-    sidebar_toggle.set_icon_name("sidebar-show-symbolic");
-    sidebar_toggle.set_tooltip_text(Some("Show or hide the folder sidebar"));
+    sidebar_toggle.set_icon_name("pan-start-symbolic");
+    sidebar_toggle.set_tooltip_text(Some("Collapse or show the folder sidebar"));
     sidebar_toggle.add_css_class("flat");
     sidebar_toggle.set_active(true);
     let sidebar_for_toggle = sidebar_scrolled.clone();
-    sidebar_toggle.connect_toggled(move |b| sidebar_for_toggle.set_visible(b.is_active()));
+    sidebar_toggle.connect_toggled(move |b| {
+        let shown = b.is_active();
+        sidebar_for_toggle.set_visible(shown);
+        b.set_icon_name(if shown {
+            "pan-start-symbolic"
+        } else {
+            "pan-end-symbolic"
+        });
+    });
     header.pack_start(&sidebar_toggle);
 
     // Clones of the sidebar model for live follow/unfollow mutation, and the
@@ -1265,7 +1275,9 @@ fn trigger_delete_draft(
 fn build_sidebar(state: &AppState) -> (ScrolledWindow, ListStore, gtk4::ListBox) {
     let scrolled = ScrolledWindow::new();
     scrolled.set_policy(PolicyType::Never, PolicyType::Automatic);
-    scrolled.set_min_content_width(180);
+    // Low floor so the pane can be dragged narrow (names ellipsise); the
+    // header toggle hides it outright.
+    scrolled.set_min_content_width(90);
 
     // Build the model of FolderItems
     let sidebar_model = ListStore::new::<FolderItem>();
@@ -1515,6 +1527,7 @@ fn make_sidebar_row(item: &FolderItem) -> ListBoxRow {
     let label = Label::new(Some(&item.name()));
     label.set_hexpand(true);
     label.set_xalign(0.0);
+    label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
     if matches!(kind, FolderKind::ProfileHeader | FolderKind::FollowHeader) {
         label.add_css_class("heading");
         label.add_css_class("caption");
