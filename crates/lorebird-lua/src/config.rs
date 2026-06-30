@@ -79,6 +79,11 @@ pub struct AppConfig {
     /// long recipient lists behind the expand toggle.
     #[serde(default)]
     pub expand_headers: bool,
+    /// Default reading-pane width in monospace columns. 100 fits a kernel
+    /// patch (checkpatch caps lines at 100), an 80-column quoted reply and a
+    /// 75-column commit log without wrapping. The divider stays draggable.
+    #[serde(default = "default_reading_pane_columns")]
+    pub reading_pane_columns: usize,
     pub profiles: HashMap<String, ProfileData>,
 }
 
@@ -86,6 +91,9 @@ pub struct AppConfig {
 /// above a typical bounded maildir so every message threads, while still
 /// capping a runaway maildir from threading millions of rows in memory.
 pub const DEFAULT_WORKING_SET_LIMIT: usize = 500_000;
+
+/// Default reading-pane width when `reading_pane_columns` is unset.
+pub const DEFAULT_READING_PANE_COLUMNS: usize = 100;
 
 fn default_theme() -> String {
     "light".to_string()
@@ -97,6 +105,10 @@ fn default_ui_scale() -> f64 {
 
 fn default_working_set_limit() -> usize {
     DEFAULT_WORKING_SET_LIMIT
+}
+
+fn default_reading_pane_columns() -> usize {
+    DEFAULT_READING_PANE_COLUMNS
 }
 
 // ── Hook types (Lua function handles) ──────────────────────────────
@@ -269,6 +281,7 @@ mod tests {
             ui_scale: 1.0,
             working_set_limit: DEFAULT_WORKING_SET_LIMIT,
             expand_headers: false,
+            reading_pane_columns: DEFAULT_READING_PANE_COLUMNS,
             profiles: {
                 let mut m = HashMap::new();
                 m.insert(

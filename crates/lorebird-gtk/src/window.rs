@@ -138,12 +138,22 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     inner_paned.set_shrink_start_child(false);
 
     let preview = build_preview_pane(&preview_labels);
+    // Default the reading pane to `reading_pane_columns` of monospace text.
+    // resize_end_child(false) keeps it at that width while the thread list
+    // takes the slack on resize; shrink stays on so the divider drags in.
+    let cols = state_ref.reading_pane_columns.clamp(40, 400) as i32;
+    let preview_px = reading_pane_width_px(&window, cols);
+    preview.set_width_request(preview_px);
     inner_paned.set_end_child(Some(&preview));
-    inner_paned.set_shrink_end_child(false);
-    inner_paned.set_position(550);
+    inner_paned.set_resize_start_child(true);
+    inner_paned.set_resize_end_child(false);
+    inner_paned.set_shrink_end_child(true);
 
     outer_paned.set_end_child(Some(&inner_paned));
-    outer_paned.set_position(180);
+    outer_paned.set_position(SIDEBAR_WIDTH);
+    // Size the window so the sidebar, a usable thread list and the reading
+    // pane all fit without crowding.
+    window.set_default_size(SIDEBAR_WIDTH + 520 + preview_px, 760);
     outer_paned.set_vexpand(true);
     outer_paned.set_hexpand(true);
 
@@ -2049,6 +2059,22 @@ fn make_header_key(text: &str) -> Label {
 
 /// Length past which a From/To/Cc value is truncated in the collapsed view.
 const HEADER_TRUNCATE_MAX: usize = 120;
+
+/// Default width of the folder sidebar, in pixels.
+const SIDEBAR_WIDTH: i32 = 180;
+
+/// Pixel width that fits `columns` monospace characters in the reading pane,
+/// with an allowance for the body's line-number gutter, margins and scrollbar.
+fn reading_pane_width_px(widget: &impl glib::object::IsA<gtk4::Widget>, columns: i32) -> i32 {
+    let ctx = widget.pango_context();
+    let mut desc = ctx
+        .font_description()
+        .unwrap_or_else(|| gtk4::pango::FontDescription::from_string("Monospace 11"));
+    desc.set_family("Monospace");
+    let metrics = ctx.metrics(Some(&desc), None);
+    let char_px = (metrics.approximate_char_width() / gtk4::pango::SCALE).max(7);
+    char_px * columns + 96
+}
 
 fn truncate_addr(s: &str) -> String {
     if s.len() <= HEADER_TRUNCATE_MAX {

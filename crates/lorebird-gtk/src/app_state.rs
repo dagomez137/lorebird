@@ -92,6 +92,10 @@ pub struct AppState {
     /// Show full From/To/Cc headers by default (config `expand_headers`).
     pub expand_headers: bool,
 
+    /// Default reading-pane width in monospace columns (config
+    /// `reading_pane_columns`).
+    pub reading_pane_columns: usize,
+
     /// Followed series (persisted to follows.json), shown in the sidebar
     /// and optionally merged into the inbox view.
     pub follows: RefCell<Vec<Follow>>,
@@ -117,6 +121,7 @@ impl AppState {
                     ui_scale: 1.0,
                     working_set_limit: lorebird_lua::DEFAULT_WORKING_SET_LIMIT,
                     expand_headers: false,
+                    reading_pane_columns: lorebird_lua::DEFAULT_READING_PANE_COLUMNS,
                     has_on_reply: false,
                     has_on_send: false,
                 }
@@ -140,6 +145,7 @@ impl AppState {
             theme: init.theme,
             ui_scale: init.ui_scale,
             expand_headers: init.expand_headers,
+            reading_pane_columns: init.reading_pane_columns,
             follows: RefCell::new(lorebird_core::follows::load()),
             active_is_inbox: Cell::new(false),
         }
