@@ -5,7 +5,7 @@
 //! row sets the active profile (and optionally the view query).
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -13,11 +13,12 @@ use gio::ListStore;
 use glib::Object;
 use gtk4::prelude::*;
 use gtk4::{
-    Align, Application, ApplicationWindow, Box, CustomSorter, Grid, HeaderBar, IconSize, Image,
-    Label, ListBoxRow, ListItem, ListView, Ordering, Orientation, Paned, PolicyType, ScrolledWindow,
-    SearchEntry, SignalListItemFactory, SingleSelection, SortListModel, Spinner, ToggleButton,
-    TreeExpander, TreeListModel, TreeListRow, WrapMode,
+    Align, Application, ApplicationWindow, Box, CustomSorter, FlowBox, Grid, HeaderBar, IconSize,
+    Image, Label, ListBoxRow, ListItem, ListView, Ordering, Orientation, Paned, PolicyType,
+    ScrolledWindow, SearchEntry, SignalListItemFactory, SingleSelection, SortListModel, Spinner,
+    ToggleButton, TreeExpander, TreeListModel, TreeListRow, WrapMode,
 };
+use lorebird_lua::ContactGroup;
 use sourceview5 as sv;
 use sourceview5::prelude::*;
 
@@ -48,8 +49,25 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     } else {
         "rgba(53, 132, 228, 0.12)"
     };
+    // Whole-thread tint plus the recipient-pill rules. The pill rules are built
+    // once from the distinct colours the configured contact groups actually use:
+    // one `.pill-c<hex>` class per colour, a neutral `.pill` base, and a `.pill-dim`
+    // for unmatched recipients. `@theme_fg_color` keeps the neutral chip theme-adaptive.
+    let mut css_data = format!(".thread-active {{ background-color: {tint}; }}\n");
+    css_data.push_str(PILL_BASE_CSS);
+    let mut seen_pill_colors: HashSet<String> = HashSet::new();
+    for group in &state_ref.contact_groups {
+        if let Some(hex) = resolve_pill_color(&group.color)
+            && seen_pill_colors.insert(hex.clone())
+        {
+            let class = pill_class_for_hex(&hex);
+            css_data.push_str(&format!(
+                ".{class} {{ background-color: alpha({hex}, 0.15); color: {hex}; }}\n"
+            ));
+        }
+    }
     let css = gtk4::CssProvider::new();
-    css.load_from_data(&format!(".thread-active {{ background-color: {tint}; }}"));
+    css.load_from_data(&css_data);
     if let Some(display) = gtk4::gdk::Display::default() {
         gtk4::style_context_add_provider_for_display(
             &display,
@@ -448,16 +466,16 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
 
     // ── Wire selection → preview ──────────────────────────────
     let pl = preview_labels;
-    // Shared so the toggle handler can re-render the same labels the selection
-    // handler writes, without re-reading the node.
-    let header_full: Rc<RefCell<(String, String, String)>> =
-        Rc::new(RefCell::new((String::new(), String::new(), String::new())));
-    let toggle_from = pl.from_label.clone();
-    let toggle_to = pl.to_label.clone();
-    let toggle_cc = pl.cc_label.clone();
+    // Contact groups drive the per-recipient pill colour. Shared with the
+    // selection handler that rebuilds the chips on every selection.
+    let contact_groups: Rc<Vec<ContactGroup>> = Rc::new(state_ref.contact_groups.clone());
+    let contact_groups_sel = contact_groups.clone();
+    // The expand toggle only flips each field's wrap-vs-single-row policy, so it
+    // needs the scrolled wrappers, not the chip containers.
+    let toggle_from = pl.from.scroll.clone();
+    let toggle_to = pl.to.scroll.clone();
+    let toggle_cc = pl.cc.scroll.clone();
     let toggle_btn = pl.expand_toggle.clone();
-    let header_full_sel = header_full.clone();
-    let header_full_tog = header_full.clone();
     let state_for_preview = state.clone();
     selection.connect_selection_changed(move |sel, _pos, _n| {
         if let Some(obj) = sel.selected_item()
@@ -486,15 +504,17 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
             let to_full = node.to_addrs();
             let cc_full = node.cc_addrs();
             let expanded = pl.expand_toggle.is_active();
-            apply_header_field(&pl.from_label, &from_full, expanded);
-            apply_header_field(&pl.to_label, &to_full, expanded);
-            apply_header_field(&pl.cc_label, &cc_full, expanded);
+            render_recipient_chips(&pl.from.flow, &from_full, &contact_groups_sel);
+            render_recipient_chips(&pl.to.flow, &to_full, &contact_groups_sel);
+            render_recipient_chips(&pl.cc.flow, &cc_full, &contact_groups_sel);
+            apply_chip_expand(&pl.from.scroll, expanded);
+            apply_chip_expand(&pl.to.scroll, expanded);
+            apply_chip_expand(&pl.cc.scroll, expanded);
             // Offer the toggle only when something is actually clipped.
             let has_long = from_full.len() > HEADER_TRUNCATE_MAX
                 || to_full.len() > HEADER_TRUNCATE_MAX
                 || cc_full.len() > HEADER_TRUNCATE_MAX;
             pl.expand_toggle.set_visible(has_long);
-            *header_full_sel.borrow_mut() = (from_full, to_full, cc_full);
             pl.subject_label.set_text(&node.subject());
             pl.date_label.set_text(&node.last_reply());
             let mid = node.message_id();
@@ -509,26 +529,22 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
             }
             return;
         }
-        pl.from_label.set_text("");
-        pl.to_label.set_text("");
-        pl.to_label.set_tooltip_text(None);
-        pl.cc_label.set_text("");
-        pl.cc_label.set_tooltip_text(None);
+        clear_chips(&pl.from.flow);
+        clear_chips(&pl.to.flow);
+        clear_chips(&pl.cc.flow);
         pl.expand_toggle.set_visible(false);
         pl.subject_label.set_text("");
         pl.date_label.set_text("");
         pl.message_id_label.set_text("");
-        *header_full_sel.borrow_mut() = (String::new(), String::new(), String::new());
         set_body_with_highlight(&pl.body_buffer, "");
     });
 
     toggle_btn.connect_toggled(move |btn| {
         let expanded = btn.is_active();
         btn.set_icon_name(header_toggle_icon(expanded));
-        let full = header_full_tog.borrow();
-        apply_header_field(&toggle_from, &full.0, expanded);
-        apply_header_field(&toggle_to, &full.1, expanded);
-        apply_header_field(&toggle_cc, &full.2, expanded);
+        apply_chip_expand(&toggle_from, expanded);
+        apply_chip_expand(&toggle_to, expanded);
+        apply_chip_expand(&toggle_cc, expanded);
     });
 
     // ── Track the currently selected node for Reply ────────────
@@ -1602,11 +1618,19 @@ fn make_sidebar_row(item: &FolderItem) -> ListBoxRow {
 
 // ── Center pane ───────────────────────────────────────────────────
 
+/// A recipient field rendered as wrapping pill chips. `flow` holds one chip
+/// (a `Label` with the `pill` class) per recipient; `scroll` wraps it so the
+/// expand toggle can switch between a single clipped row and a wrapped block.
+pub(crate) struct ChipField {
+    pub flow: FlowBox,
+    pub scroll: ScrolledWindow,
+}
+
 /// Labels in the preview pane that need to be updated on selection change.
 pub(crate) struct PreviewLabels {
-    pub from_label: Label,
-    pub to_label: Label,
-    pub cc_label: Label,
+    pub from: ChipField,
+    pub to: ChipField,
+    pub cc: ChipField,
     pub subject_label: Label,
     pub date_label: Label,
     pub message_id_label: Label,
@@ -1663,16 +1687,10 @@ fn build_center_pane(
     scrolled.set_child(Some(&thread_view));
     vbox.append(&scrolled);
 
-    // ── Preview labels (updated on selection) ────────────────
-    let from_label = Label::new(Some("no message selected"));
-    from_label.set_xalign(0.0);
-    from_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-    let to_label = Label::new(Some(""));
-    to_label.set_xalign(0.0);
-    to_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-    let cc_label = Label::new(Some(""));
-    cc_label.set_xalign(0.0);
-    cc_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    // ── Preview recipient chip fields (rebuilt on selection) ──
+    let from = make_chip_field(expand_headers);
+    let to = make_chip_field(expand_headers);
+    let cc = make_chip_field(expand_headers);
     let subject_label = Label::new(Some(""));
     subject_label.set_xalign(0.0);
     // Wrap with a character fallback so the whole subject shows yet its width
@@ -1717,9 +1735,9 @@ fn build_center_pane(
     lore_btn.set_sensitive(false);
 
     let preview_labels = PreviewLabels {
-        from_label,
-        to_label,
-        cc_label,
+        from,
+        to,
+        cc,
         subject_label,
         date_label,
         message_id_label,
@@ -2050,9 +2068,19 @@ fn build_preview_pane(labels: &PreviewLabels) -> Box {
         grid.attach(&v, 1, row, 1, 1);
     };
 
-    add_row(&headers, 0, "From", &labels.from_label);
-    add_row(&headers, 1, "To", &labels.to_label);
-    add_row(&headers, 2, "Cc", &labels.cc_label);
+    // From/To/Cc are chip rows; the key label aligns to the top of a field that
+    // may grow to several wrapped rows.
+    let add_chip_row = |grid: &Grid, row: i32, key: &str, field: &ChipField| {
+        let k = make_header_key(key);
+        k.set_valign(Align::Start);
+        grid.attach(&k, 0, row, 1, 1);
+        field.scroll.set_hexpand(true);
+        grid.attach(&field.scroll, 1, row, 1, 1);
+    };
+
+    add_chip_row(&headers, 0, "From", &labels.from);
+    add_chip_row(&headers, 1, "To", &labels.to);
+    add_chip_row(&headers, 2, "Cc", &labels.cc);
     add_row(&headers, 3, "Subject", &labels.subject_label);
     add_row(&headers, 4, "Date", &labels.date_label);
     add_row(&headers, 5, "Message-ID", &labels.message_id_label);
@@ -2177,35 +2205,67 @@ fn header_toggle_icon(expanded: bool) -> &'static str {
     }
 }
 
-/// Fully wrapped when `expanded`, otherwise a single ellipsised line capped
-/// at `HEADER_TRUNCATE_MAX` with the full text in a tooltip.
-fn apply_header_field(label: &Label, full: &str, expanded: bool) {
-    let markup = address_markup(full);
-    if expanded {
-        label.set_ellipsize(gtk4::pango::EllipsizeMode::None);
-        label.set_wrap(true);
-        label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
-        label.set_markup(&markup);
-        label.set_tooltip_text(None);
-    } else {
-        label.set_wrap(false);
-        label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-        label.set_markup(&markup);
-        // The label ellipsises the rendered run, so the full value goes to the
-        // tooltip when long.
-        if full.len() > HEADER_TRUNCATE_MAX {
-            label.set_tooltip_text(Some(full));
-        } else {
-            label.set_tooltip_text(None);
-        }
+// ── Recipient pill chips ──────────────────────────────────────────
+
+/// Base CSS for the recipient pills: a compact chip shape, plus a neutral
+/// `.pill-dim` for unmatched recipients. The per-colour `.pill-c<hex>` rules are
+/// generated in `build_window` from the configured contact groups. The dim chip
+/// uses `@theme_fg_color` so it tracks the light/dark theme.
+const PILL_BASE_CSS: &str = "\
+.chips > flowboxchild { padding: 0; min-height: 0; min-width: 0; }
+.pill { border-radius: 9px; padding: 1px 8px; font-size: 0.9em; }
+.pill-dim { background-color: alpha(@theme_fg_color, 0.08); color: alpha(@theme_fg_color, 0.55); }
+";
+
+/// The seven palette names accepted in a contact group's `color`, mapped to
+/// tasteful Adwaita-ish hexes. A `#rrggbb` value is used verbatim instead.
+fn palette_hex(name: &str) -> Option<&'static str> {
+    match name {
+        "blue" => Some("#3584e4"),
+        "green" => Some("#2ec27e"),
+        "orange" => Some("#e66100"),
+        "red" => Some("#e01b24"),
+        "purple" => Some("#9141ac"),
+        "teal" => Some("#2190a4"),
+        "yellow" => Some("#e5a50a"),
+        _ => None,
     }
 }
 
-/// Pango markup for a recipient list: each `Name <addr>` rendered with the name
-/// in plain text and the address dimmed (alpha is relative to the text colour,
-/// so it adapts to the theme). Splits on top-level commas, ignoring commas
-/// inside `<...>`.
-fn address_markup(value: &str) -> String {
+/// Resolve a contact-group colour to a lowercase `#rrggbb` hex. Accepts a
+/// palette name or a `#rrggbb` literal; returns `None` for anything else so an
+/// unknown colour falls back to the neutral dim chip rather than crashing.
+fn resolve_pill_color(color: &str) -> Option<String> {
+    let c = color.trim();
+    if let Some(hex) = c.strip_prefix('#') {
+        if hex.len() == 6 && hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            return Some(format!("#{}", hex.to_ascii_lowercase()));
+        }
+        return None;
+    }
+    palette_hex(&c.to_ascii_lowercase()).map(str::to_string)
+}
+
+/// CSS class name for a resolved hex, e.g. `#3584e4` → `pill-c3584e4`. The hex
+/// digits form a valid CSS identifier.
+fn pill_class_for_hex(hex: &str) -> String {
+    format!("pill-c{}", hex.trim_start_matches('#'))
+}
+
+/// The first contact group whose patterns match `address` (case-insensitive
+/// substring against the bare address). `None` if no group matches.
+fn contact_group_for<'a>(address: &str, groups: &'a [ContactGroup]) -> Option<&'a ContactGroup> {
+    let addr = address.to_ascii_lowercase();
+    groups.iter().find(|g| {
+        g.patterns.iter().any(|p| {
+            let p = p.trim();
+            !p.is_empty() && addr.contains(&p.to_ascii_lowercase())
+        })
+    })
+}
+
+/// Split a recipient list on top-level commas, ignoring commas inside `<...>`.
+fn split_addresses(value: &str) -> Vec<&str> {
     let mut parts: Vec<&str> = Vec::new();
     let (mut start, mut depth) = (0usize, 0i32);
     for (i, c) in value.char_indices() {
@@ -2221,24 +2281,183 @@ fn address_markup(value: &str) -> String {
     }
     parts.push(&value[start..]);
     parts
-        .iter()
-        .map(|p| one_address_markup(p.trim()))
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
-fn one_address_markup(addr: &str) -> String {
-    match addr.find('<') {
+/// The bare address of a recipient: the part inside `<...>`, or the whole token
+/// trimmed when there are no angle brackets.
+fn recipient_address(part: &str) -> &str {
+    if let Some(i) = part.find('<') {
+        let rest = &part[i + 1..];
+        return rest.split('>').next().unwrap_or(rest).trim();
+    }
+    part.trim()
+}
+
+/// Pango markup for one recipient: the display name plain, the `<address>`
+/// dimmed (alpha is relative to the chip's text colour, so it stays legible in
+/// any pill colour). Escapes name and address.
+fn recipient_markup(part: &str) -> String {
+    let part = part.trim();
+    match part.find('<') {
         Some(i) => {
-            let name = glib::markup_escape_text(addr[..i].trim());
-            let email = glib::markup_escape_text(addr[i..].trim());
+            let name = glib::markup_escape_text(part[..i].trim().trim_matches('"').trim());
+            let email = glib::markup_escape_text(part[i..].trim());
             if name.is_empty() {
                 format!("<span alpha=\"55%\">{email}</span>")
             } else {
                 format!("{name} <span alpha=\"55%\">{email}</span>")
             }
         }
-        None => glib::markup_escape_text(addr).to_string(),
+        None => glib::markup_escape_text(part).to_string(),
+    }
+}
+
+/// Build a recipient chip field: a wrapping `FlowBox` inside a `ScrolledWindow`
+/// so the expand toggle can switch between a clipped single row and a wrapped
+/// block. Starts collapsed unless `expanded` (the `expand_headers` default).
+fn make_chip_field(expanded: bool) -> ChipField {
+    let flow = FlowBox::new();
+    flow.set_selection_mode(gtk4::SelectionMode::None);
+    flow.set_max_children_per_line(1000);
+    flow.set_min_children_per_line(1);
+    flow.set_row_spacing(2);
+    flow.set_column_spacing(2);
+    flow.set_homogeneous(false);
+    flow.set_halign(Align::Start);
+    flow.set_valign(Align::Start);
+    flow.add_css_class("chips");
+
+    let scroll = ScrolledWindow::new();
+    // Keep the field's natural width from widening the reading pane, but let it
+    // grow as tall as the wrapped chips need.
+    scroll.set_propagate_natural_width(false);
+    scroll.set_propagate_natural_height(true);
+    scroll.set_child(Some(&flow));
+    let field = ChipField { flow, scroll };
+    apply_chip_expand(&field.scroll, expanded);
+    field
+}
+
+/// Expanded wraps the chips to as many rows as needed (no horizontal scroll, so
+/// the FlowBox is width-bounded and wraps). Collapsed lays them out in one
+/// natural-width row, clipped by the scroller (`External` hides the scrollbar
+/// while still allowing the row to extend past the viewport). Per-chip tooltips
+/// keep the full `Name <addr>` reachable in both modes.
+fn apply_chip_expand(scroll: &ScrolledWindow, expanded: bool) {
+    if expanded {
+        scroll.set_policy(PolicyType::Never, PolicyType::Never);
+    } else {
+        scroll.set_policy(PolicyType::External, PolicyType::Never);
+    }
+}
+
+/// Remove every chip from a field's FlowBox without leaking child widgets.
+fn clear_chips(flow: &FlowBox) {
+    while let Some(child) = flow.first_child() {
+        flow.remove(&child);
+    }
+}
+
+/// Rebuild a recipient field's chips from a header value. Each recipient becomes
+/// a `pill` chip showing the display name (or address), with the full
+/// `Name <addr>` in its tooltip; a contact-group match tints it with that
+/// group's colour class, everything else gets the neutral `pill-dim`.
+fn render_recipient_chips(flow: &FlowBox, value: &str, groups: &[ContactGroup]) {
+    clear_chips(flow);
+    for part in split_addresses(value) {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        // Show the full RFC address; the address part is dimmed within the pill.
+        let chip = Label::new(None);
+        chip.set_markup(&recipient_markup(part));
+        chip.add_css_class("pill");
+        chip.set_tooltip_text(Some(part));
+        chip.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        chip.set_max_width_chars(48);
+        match contact_group_for(recipient_address(part), groups)
+            .and_then(|g| resolve_pill_color(&g.color))
+        {
+            Some(hex) => chip.add_css_class(&pill_class_for_hex(&hex)),
+            None => chip.add_css_class("pill-dim"),
+        }
+        flow.insert(&chip, -1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn group(color: &str, patterns: &[&str]) -> ContactGroup {
+        ContactGroup {
+            name: String::new(),
+            color: color.to_string(),
+            patterns: patterns.iter().map(|p| p.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn palette_names_and_hex_resolve() {
+        assert_eq!(resolve_pill_color("blue").as_deref(), Some("#3584e4"));
+        assert_eq!(resolve_pill_color(" Teal ").as_deref(), Some("#2190a4"));
+        assert_eq!(resolve_pill_color("#AABBCC").as_deref(), Some("#aabbcc"));
+        // Unknown name and malformed hex fall back to None (dim chip).
+        assert_eq!(resolve_pill_color("chartreuse"), None);
+        assert_eq!(resolve_pill_color("#xyz"), None);
+        assert_eq!(resolve_pill_color("#abcd"), None);
+    }
+
+    #[test]
+    fn pill_class_is_valid_identifier() {
+        assert_eq!(pill_class_for_hex("#3584e4"), "pill-c3584e4");
+    }
+
+    #[test]
+    fn split_handles_commas_inside_brackets() {
+        let parts = split_addresses("Jane <jane@x>, John <john@y>, plain@z");
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[1].trim(), "John <john@y>");
+        // A top-level comma inside angle brackets does not split.
+        let parts = split_addresses("A <a@x,y>, b@z");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].trim(), "A <a@x,y>");
+    }
+
+    #[test]
+    fn address_and_markup_extraction() {
+        assert_eq!(recipient_address("Jane <jane@kernel.org>"), "jane@kernel.org");
+        assert_eq!(recipient_address("bare@kernel.org"), "bare@kernel.org");
+        // The chip shows the full RFC address with the address part dimmed.
+        assert_eq!(
+            recipient_markup("Jane <jane@kernel.org>"),
+            "Jane <span alpha=\"55%\">&lt;jane@kernel.org&gt;</span>"
+        );
+        // No name: just the dimmed address.
+        assert_eq!(
+            recipient_markup("<jane@kernel.org>"),
+            "<span alpha=\"55%\">&lt;jane@kernel.org&gt;</span>"
+        );
+        assert_eq!(recipient_markup("bare@kernel.org"), "bare@kernel.org");
+    }
+
+    #[test]
+    fn matching_is_case_insensitive_and_first_wins() {
+        let groups = [
+            group("blue", &["KERNEL.ORG"]),
+            group("green", &["torvalds"]),
+        ];
+        // Substring match against the address, case-insensitive.
+        let g = contact_group_for("Linus@Kernel.Org", &groups).unwrap();
+        assert_eq!(g.color, "blue");
+        // First matching group wins even when a later one also matches.
+        let g = contact_group_for("torvalds@kernel.org", &groups).unwrap();
+        assert_eq!(g.color, "blue");
+        // No match.
+        assert!(contact_group_for("nobody@example.com", &groups).is_none());
+        // Empty patterns never match.
+        assert!(contact_group_for("a@b.c", &[group("red", &[""])]).is_none());
     }
 }
 

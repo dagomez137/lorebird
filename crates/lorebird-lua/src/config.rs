@@ -54,6 +54,19 @@ pub struct ProfileData {
     pub smtp: Option<SmtpConfig>,
 }
 
+/// A named group of addresses that stand out as a coloured pill in the
+/// recipient fields. `color` is a palette name (blue, green, orange, red,
+/// purple, teal, yellow) or a `#rrggbb` hex value; `match` is a list of
+/// case-insensitive substrings tested against each address.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContactGroup {
+    #[serde(default)]
+    pub name: String,
+    pub color: String,
+    #[serde(default, rename = "match")]
+    pub patterns: Vec<String>,
+}
+
 /// Top-level config data (deserialisable from Lua, **excludes** hooks).
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
@@ -88,6 +101,9 @@ pub struct AppConfig {
     /// subject-focused list. Off by default (the roomier two-line layout).
     #[serde(default)]
     pub compact_list: bool,
+    /// Address groups coloured as pills in the recipient fields.
+    #[serde(default)]
+    pub contact_groups: Vec<ContactGroup>,
     pub profiles: HashMap<String, ProfileData>,
 }
 
@@ -287,6 +303,7 @@ mod tests {
             expand_headers: false,
             reading_pane_columns: DEFAULT_READING_PANE_COLUMNS,
             compact_list: false,
+            contact_groups: Vec::new(),
             profiles: {
                 let mut m = HashMap::new();
                 m.insert(

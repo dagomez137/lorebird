@@ -99,6 +99,10 @@ pub struct AppState {
     /// Tighten the thread list rows (config `compact_list`).
     pub compact_list: bool,
 
+    /// Address groups coloured as pills in the recipient fields
+    /// (config `contact_groups`).
+    pub contact_groups: Vec<lorebird_lua::ContactGroup>,
+
     /// Followed series (persisted to follows.json), shown in the sidebar
     /// and optionally merged into the inbox view.
     pub follows: RefCell<Vec<Follow>>,
@@ -126,6 +130,7 @@ impl AppState {
                     expand_headers: false,
                     reading_pane_columns: lorebird_lua::DEFAULT_READING_PANE_COLUMNS,
                     compact_list: false,
+                    contact_groups: Vec::new(),
                     has_on_reply: false,
                     has_on_send: false,
                 }
@@ -151,6 +156,7 @@ impl AppState {
             expand_headers: init.expand_headers,
             reading_pane_columns: init.reading_pane_columns,
             compact_list: init.compact_list,
+            contact_groups: init.contact_groups,
             follows: RefCell::new(lorebird_core::follows::load()),
             active_is_inbox: Cell::new(false),
         }
