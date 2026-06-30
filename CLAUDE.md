@@ -60,6 +60,8 @@ A Xapian-style mini-language is parsed with nom into a `Query` AST, then **eithe
 
 Field prefixes: `s:`/`subject`, `f:`/`from`, `b:`/`body`, `to:`, `cc:`, `l:`/`list` (→ List-Id), `a:`/`addr` (fans out across From/To/Cc), plus a `date:N<unit>..` relative-range sublanguage. Note: there is **no `from:(a OR b)` grouping** — write `from:a OR from:b`.
 
+`is:` is an archived-state predicate, not a text match: `is:archived` (only archived), `is:any`/`is:all` (both), `is:active` or absent (exclude archived — the default for views). It contributes nothing to the FTS string and is a no-op in the in-memory `matches`; the actual filtering is applied via `ArchivedFilter` (the in-memory path checks the archived id-set; `search` emits a conditional `IN/NOT IN archived` clause). All Mail's separate LoadAll path is unaffected and always shows everything.
+
 ### Indexing & threading notes (non-obvious, learned the hard way)
 - The indexer is `INSERT OR IGNORE` keyed on the filename UNIQUE constraint, so it only writes rows for *new* files — existing rows are **not** backfilled when columns are added. Enabling a new indexed column requires deleting `<maildir>/.lorebird.db` and re-indexing.
 - Indexing runs in a **single SQLite transaction**; on a very large maildir this is an all-or-nothing, multi-hour operation. Keep the indexed set bounded (fetch windows in `config.lua`).

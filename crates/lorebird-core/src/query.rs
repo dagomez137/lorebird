@@ -96,6 +96,23 @@ pub fn parse_query(input: &str) -> Result<Query, nom::Err<nom::error::Error<&str
 
 // ── FTS5 bridge ────────────────────────────────────────────────────────
 
+/// Whether a query selects active (non-archived), archived, or all messages.
+///
+/// Driven by `is:` predicates in the query: `is:archived` → only archived,
+/// `is:any` (or `is:all`) → both, anything else / absent → `Active`. Views
+/// default to `Active` so archived mail stays hidden until explicitly asked
+/// for; All Mail uses its own unfiltered path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ArchivedFilter {
+    /// Exclude archived messages — the default for views.
+    #[default]
+    Active,
+    /// Only archived messages.
+    Archived,
+    /// Both archived and non-archived.
+    Any,
+}
+
 /// Materialised query ready to hand to SQLite.
 #[derive(Debug, Clone)]
 pub struct ParsedQuery {
@@ -105,18 +122,20 @@ pub struct ParsedQuery {
     pub date_range: Option<DateRange>,
     /// Limit on the number of results.
     pub limit: i64,
+    /// Archived-state filter derived from `is:` predicates.
+    pub archived: ArchivedFilter,
 }
 
 impl ParsedQuery {
     /// Create a query that matches everything.
     pub fn all() -> Self {
-        Self { fts5: String::new(), date_range: None, limit: 50 }
+        Self { fts5: String::new(), date_range: None, limit: 50, archived: ArchivedFilter::Active }
     }
 
     /// Build a materialised query from a parsed AST.
     pub fn from_ast(query: &Query, limit: i64) -> Self {
         let (fts5, date_range) = Self::build(query);
-        Self { fts5, date_range, limit }
+        Self { fts5, date_range, limit, archived: archived_filter(query) }
     }
 
     /// Walk the AST and produce an FTS5 expression plus an optional date range.
@@ -133,6 +152,11 @@ impl ParsedQuery {
                         e = escaped
                     );
                     return (term, None);
+                }
+                // `is:` is an archived-state predicate, not a text match — it
+                // contributes nothing to the FTS expression (see ArchivedFilter).
+                if prefix.eq_ignore_ascii_case("is") {
+                    return (String::new(), None);
                 }
                 let col = map_prefix_to_column(prefix);
                 let term = match col {
@@ -230,6 +254,10 @@ pub fn matches(query: &Query, msg: &FilterFields) -> bool {
                 "s" | "subject" => contains_ci(msg.subject, &needle),
                 // Body is not cached → can't be satisfied here.
                 "b" | "body" => false,
+                // `is:` is an archived-state predicate handled separately by
+                // the caller (via ArchivedFilter + the archived id-set), so it
+                // is a no-op for text matching here.
+                "is" => true,
                 // Unknown prefix → search across the available text fields.
                 _ => matches_any_text(msg, &needle),
             }
@@ -280,6 +308,36 @@ pub fn needs_body(query: &Query) -> bool {
     }
 }
 
+/// Derive the [`ArchivedFilter`] from any `is:` predicates in the query.
+///
+/// `is:archived` → [`ArchivedFilter::Archived`], `is:any`/`is:all` →
+/// [`ArchivedFilter::Any`]; with none present (or only `is:active`) the
+/// default [`ArchivedFilter::Active`] hides archived mail. If several appear,
+/// `Archived` wins over `Any` wins over `Active`.
+pub fn archived_filter(query: &Query) -> ArchivedFilter {
+    fn of_value(value: &str) -> ArchivedFilter {
+        match value.to_lowercase().as_str() {
+            "archived" => ArchivedFilter::Archived,
+            "any" | "all" => ArchivedFilter::Any,
+            _ => ArchivedFilter::Active, // is:active or unrecognised
+        }
+    }
+    fn merge(a: ArchivedFilter, b: ArchivedFilter) -> ArchivedFilter {
+        use ArchivedFilter::*;
+        match (a, b) {
+            (Archived, _) | (_, Archived) => Archived,
+            (Any, _) | (_, Any) => Any,
+            _ => Active,
+        }
+    }
+    match query {
+        Query::Field { prefix, value } if prefix.eq_ignore_ascii_case("is") => of_value(value),
+        Query::And(a, b) | Query::Or(a, b) => merge(archived_filter(a), archived_filter(b)),
+        Query::Not(a) => archived_filter(a),
+        _ => ArchivedFilter::Active,
+    }
+}
+
 /// Map a user-facing prefix to an FTS5 column name.
 fn map_prefix_to_column(prefix: &str) -> Option<&'static str> {
     match prefix.to_lowercase().as_str() {
@@ -301,32 +359,50 @@ pub fn query_to_fts5(query: &Query) -> String {
     ParsedQuery::build(query).0
 }
 
+/// SQL fragment applying the archived-state filter to `col` (a column
+/// expression like `message_id` or `f.message_id`). Returns a leading-space
+/// `AND …` clause, or empty for [`ArchivedFilter::Any`]. The text is fixed
+/// (no user input), so it is safe to interpolate into the statement.
+fn archived_sql(filter: ArchivedFilter, col: &str) -> String {
+    match filter {
+        ArchivedFilter::Active => {
+            format!(" AND {col} NOT IN (SELECT message_id FROM archived)")
+        }
+        ArchivedFilter::Archived => {
+            format!(" AND {col} IN (SELECT message_id FROM archived)")
+        }
+        ArchivedFilter::Any => String::new(),
+    }
+}
+
 /// Search the FTS5 index and return matching message IDs.
 pub fn search(conn: &Connection, query: &ParsedQuery) -> SqlResult<Vec<String>> {
     // ── date-filtered path ──
     if let Some(ref range) = query.date_range {
         let (start_ts, end_ts) = range.resolve();
         if query.fts5.is_empty() {
-            let mut stmt = conn.prepare(
+            let sql = format!(
                 "SELECT message_id FROM mail_ndx
-                 WHERE received_ts >= ?1 AND received_ts <= ?2
-                   AND message_id NOT IN (SELECT message_id FROM archived)
+                 WHERE received_ts >= ?1 AND received_ts <= ?2{arch}
                  ORDER BY received_ts DESC LIMIT ?3",
-            )?;
+                arch = archived_sql(query.archived, "message_id"),
+            );
+            let mut stmt = conn.prepare(&sql)?;
             return stmt
                 .query_map(params![start_ts, end_ts, query.limit], |r| r.get(0))?
                 .collect::<SqlResult<Vec<String>>>();
         }
-        let mut stmt = conn.prepare(
+        let sql = format!(
             "SELECT f.message_id
              FROM mail_fts f
              JOIN mail_ndx n USING (message_id)
              WHERE mail_fts MATCH ?1
-               AND n.received_ts >= ?2 AND n.received_ts <= ?3
-               AND f.message_id NOT IN (SELECT message_id FROM archived)
+               AND n.received_ts >= ?2 AND n.received_ts <= ?3{arch}
              ORDER BY n.received_ts DESC
              LIMIT ?4",
-        )?;
+            arch = archived_sql(query.archived, "f.message_id"),
+        );
+        let mut stmt = conn.prepare(&sql)?;
         return stmt
             .query_map(
                 params![&query.fts5, start_ts, end_ts, query.limit],
@@ -337,11 +413,13 @@ pub fn search(conn: &Connection, query: &ParsedQuery) -> SqlResult<Vec<String>> 
 
     // ── no date filter ──
     if query.fts5.is_empty() {
-        let mut stmt = conn.prepare(
+        let sql = format!(
             "SELECT message_id FROM mail_ndx
-             WHERE message_id NOT IN (SELECT message_id FROM archived)
+             WHERE 1=1{arch}
              ORDER BY received_ts DESC LIMIT ?1",
-        )?;
+            arch = archived_sql(query.archived, "message_id"),
+        );
+        let mut stmt = conn.prepare(&sql)?;
         return stmt
             .query_map(params![query.limit], |r| r.get(0))?
             .collect::<SqlResult<Vec<String>>>();
@@ -349,14 +427,15 @@ pub fn search(conn: &Connection, query: &ParsedQuery) -> SqlResult<Vec<String>> 
 
     // Join mail_ndx so the LIMIT keeps the *newest* matches, not an
     // arbitrary subset.
-    let mut stmt = conn.prepare(
+    let sql = format!(
         "SELECT f.message_id FROM mail_fts f
          JOIN mail_ndx n USING (message_id)
-         WHERE mail_fts MATCH ?1
-           AND f.message_id NOT IN (SELECT message_id FROM archived)
+         WHERE mail_fts MATCH ?1{arch}
          ORDER BY n.received_ts DESC
          LIMIT ?2",
-    )?;
+        arch = archived_sql(query.archived, "f.message_id"),
+    );
+    let mut stmt = conn.prepare(&sql)?;
     stmt.query_map(params![&query.fts5, query.limit], |r| r.get(0))?
         .collect::<SqlResult<Vec<String>>>()
 }
@@ -922,6 +1001,39 @@ mod tests {
     fn fts5_list_prefix() {
         let q = Query::Field { prefix: "l".into(), value: "linux-nvme.lists.infradead.org".into() };
         assert_eq!(query_to_fts5(&q), "list_id:\"linux-nvme.lists.infradead.org\"");
+    }
+
+    // ── archived state (is:) ──────────────────────────────────────
+    #[test]
+    fn archived_filter_detection() {
+        let f = |s: &str| archived_filter(&parse_query(s).unwrap());
+        assert_eq!(f("l:linux-mm.kvack.org"), ArchivedFilter::Active);
+        assert_eq!(f("is:active"), ArchivedFilter::Active);
+        assert_eq!(f("is:archived"), ArchivedFilter::Archived);
+        assert_eq!(f("is:any"), ArchivedFilter::Any);
+        assert_eq!(f("l:linux-mm.kvack.org AND is:archived"), ArchivedFilter::Archived);
+        assert_eq!(f("l:linux-mm.kvack.org AND is:any"), ArchivedFilter::Any);
+    }
+
+    #[test]
+    fn is_predicate_is_empty_in_fts_and_passthrough_in_matches() {
+        // `is:` contributes no FTS text and is a no-op in the in-memory match.
+        let q = parse_query("is:archived").unwrap();
+        assert_eq!(query_to_fts5(&q), "");
+        let msg = FilterFields {
+            subject: Some("hi"), from: None, to: None, cc: None,
+            list_id: Some("linux-mm.kvack.org"), received_ts: 0,
+        };
+        assert!(matches(&q, &msg)); // membership filter applied separately
+    }
+
+    #[test]
+    fn from_ast_carries_archived_filter() {
+        let q = parse_query("l:linux-mm.kvack.org AND is:archived").unwrap();
+        let pq = ParsedQuery::from_ast(&q, 50);
+        assert_eq!(pq.archived, ArchivedFilter::Archived);
+        // The list term still drives the FTS expression.
+        assert!(pq.fts5.contains("list_id:"));
     }
 
     #[test]

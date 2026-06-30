@@ -310,20 +310,35 @@ fn matched_roots(
     let use_fast_path = cache.fast_path_ok && !lorebird_core::query::needs_body(parsed);
 
     if use_fast_path {
-        let conn = open_ro(maildir)?;
-        let archived = lorebird_core::archive::load_archived_ids(&conn)
-            .map_err(|e| format!("loading archived set failed: {}", e))?;
+        use lorebird_core::query::ArchivedFilter;
+        // `is:` predicates decide whether this view shows active, archived, or
+        // all mail; default is active (archived hidden).
+        let filter = lorebird_core::query::archived_filter(parsed);
+        let archived = if filter == ArchivedFilter::Any {
+            // No membership test needed when including everything.
+            std::collections::HashSet::new()
+        } else {
+            let conn = open_ro(maildir)?;
+            lorebird_core::archive::load_archived_ids(&conn)
+                .map_err(|e| format!("loading archived set failed: {}", e))?
+        };
 
         let mut seen: HashSet<usize> = HashSet::new();
         let mut match_count = 0usize;
         for (i, thread) in cache.threads.iter().enumerate() {
             let mut thread_has_match = false;
             for_each_message(thread, &mut |m| {
-                // Exclude archived (filtered views hide them).
-                if let Some(id) = m.message_id.as_deref() {
-                    if archived.contains(id) {
-                        return;
-                    }
+                let is_archived = m
+                    .message_id
+                    .as_deref()
+                    .is_some_and(|id| archived.contains(id));
+                let keep = match filter {
+                    ArchivedFilter::Active => !is_archived,
+                    ArchivedFilter::Archived => is_archived,
+                    ArchivedFilter::Any => true,
+                };
+                if !keep {
+                    return;
                 }
                 if lorebird_core::query::matches(parsed, &filter_fields(m)) {
                     match_count += 1;
