@@ -103,9 +103,11 @@ fn build_thread_subtree<T: Message>(
     if !visited.insert(root_idx) {
         return vec![];
     }
-    let children: Vec<Thread<T>> = cs[root_idx]
-        .children
-        .clone()
+    // Take the child list out rather than cloning it: the old `cs` hierarchy
+    // is discarded right after this pass, so moving the indices is safe and
+    // avoids allocating a fresh Vec per container.
+    let child_indices = std::mem::take(&mut cs[root_idx].children);
+    let children: Vec<Thread<T>> = child_indices
         .into_iter()
         .flat_map(|child_idx| build_thread_subtree(child_idx, cs, visited))
         .collect();
