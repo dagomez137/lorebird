@@ -41,7 +41,7 @@ so the pane can show patches, quoted replies and commit logs without wrapping.
 ## Why the reading pane defaults to 100 columns
 
 100 monospace columns is the widest hard line the audience produces (the
-checkpatch code ceiling). It also comfortably fits 80-column code, a 78-column
+`checkpatch.pl` code ceiling). It also comfortably fits 80-column code, a 78-column
 email with a couple of quote levels, and a 75-column commit log, all without
 wrapping. The divider stays draggable and the count is configurable via
 `reading_pane_columns`.
