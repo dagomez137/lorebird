@@ -80,8 +80,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub expand_headers: bool,
     /// Default reading-pane width in monospace columns. 100 fits a kernel
-    /// patch (checkpatch caps lines at 100), an 80-column quoted reply and a
-    /// 75-column commit log without wrapping. The divider stays draggable.
+    /// patch (`checkpatch.pl` caps lines at 100), an 80-column quoted reply
+    /// and a 75-column commit log without wrapping. The divider stays draggable.
     #[serde(default = "default_reading_pane_columns")]
     pub reading_pane_columns: usize,
     pub profiles: HashMap<String, ProfileData>,
