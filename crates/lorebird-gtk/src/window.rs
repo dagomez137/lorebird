@@ -2169,19 +2169,6 @@ fn sender_display(from: &str) -> String {
     from.split('@').next().unwrap_or(from).to_string()
 }
 
-fn truncate_addr(s: &str) -> String {
-    if s.len() <= HEADER_TRUNCATE_MAX {
-        s.to_string()
-    } else {
-        // Find the last separator before the limit to avoid cutting mid-address
-        let cut = s[..HEADER_TRUNCATE_MAX]
-            .rfind(',')
-            .map(|i| i + 1)
-            .unwrap_or(HEADER_TRUNCATE_MAX);
-        format!("{}…", &s[..cut])
-    }
-}
-
 fn header_toggle_icon(expanded: bool) -> &'static str {
     if expanded {
         "pan-up-symbolic"
@@ -2193,21 +2180,65 @@ fn header_toggle_icon(expanded: bool) -> &'static str {
 /// Fully wrapped when `expanded`, otherwise a single ellipsised line capped
 /// at `HEADER_TRUNCATE_MAX` with the full text in a tooltip.
 fn apply_header_field(label: &Label, full: &str, expanded: bool) {
+    let markup = address_markup(full);
     if expanded {
         label.set_ellipsize(gtk4::pango::EllipsizeMode::None);
         label.set_wrap(true);
         label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
-        label.set_text(full);
+        label.set_markup(&markup);
         label.set_tooltip_text(None);
     } else {
         label.set_wrap(false);
         label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-        label.set_text(&truncate_addr(full));
+        label.set_markup(&markup);
+        // The label ellipsises the rendered run, so the full value goes to the
+        // tooltip when long.
         if full.len() > HEADER_TRUNCATE_MAX {
             label.set_tooltip_text(Some(full));
         } else {
             label.set_tooltip_text(None);
         }
+    }
+}
+
+/// Pango markup for a recipient list: each `Name <addr>` rendered with the name
+/// in plain text and the address dimmed (alpha is relative to the text colour,
+/// so it adapts to the theme). Splits on top-level commas, ignoring commas
+/// inside `<...>`.
+fn address_markup(value: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    let (mut start, mut depth) = (0usize, 0i32);
+    for (i, c) in value.char_indices() {
+        match c {
+            '<' => depth += 1,
+            '>' => depth -= 1,
+            ',' if depth <= 0 => {
+                parts.push(&value[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&value[start..]);
+    parts
+        .iter()
+        .map(|p| one_address_markup(p.trim()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn one_address_markup(addr: &str) -> String {
+    match addr.find('<') {
+        Some(i) => {
+            let name = glib::markup_escape_text(addr[..i].trim());
+            let email = glib::markup_escape_text(addr[i..].trim());
+            if name.is_empty() {
+                format!("<span alpha=\"55%\">{email}</span>")
+            } else {
+                format!("{name} <span alpha=\"55%\">{email}</span>")
+            }
+        }
+        None => glib::markup_escape_text(addr).to_string(),
     }
 }
 
