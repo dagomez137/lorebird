@@ -13,10 +13,10 @@ use gio::ListStore;
 use glib::Object;
 use gtk4::prelude::*;
 use gtk4::{
-    Application, ApplicationWindow, Box, ColumnView, ColumnViewColumn, CustomSorter, Grid,
+    Align, Application, ApplicationWindow, Box, ColumnView, ColumnViewColumn, CustomSorter, Grid,
     HeaderBar, IconSize, Image, Label, ListBoxRow, ListItem, Ordering, Orientation, Paned,
     PolicyType, ScrolledWindow, SearchEntry, SignalListItemFactory, SingleSelection, SortListModel,
-    SortType, Spinner, TreeExpander, TreeListModel, TreeListRow, WrapMode,
+    SortType, Spinner, ToggleButton, TreeExpander, TreeListModel, TreeListRow, WrapMode,
 };
 use sourceview5 as sv;
 use sourceview5::prelude::*;
@@ -116,7 +116,7 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
 
     // Center + preview
     let (center, selection, column_view, preview_labels, search_entry) =
-        build_center_pane(&state_ref.root_model, is_dark);
+        build_center_pane(&state_ref.root_model, is_dark, state_ref.expand_headers);
     inner_paned.set_start_child(Some(&center));
     inner_paned.set_shrink_start_child(false);
 
@@ -380,6 +380,16 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
 
     // ── Wire selection → preview ──────────────────────────────
     let pl = preview_labels;
+    // Shared so the toggle handler can re-render the same labels the selection
+    // handler writes, without re-reading the node.
+    let header_full: Rc<RefCell<(String, String, String)>> =
+        Rc::new(RefCell::new((String::new(), String::new(), String::new())));
+    let toggle_from = pl.from_label.clone();
+    let toggle_to = pl.to_label.clone();
+    let toggle_cc = pl.cc_label.clone();
+    let toggle_btn = pl.expand_toggle.clone();
+    let header_full_sel = header_full.clone();
+    let header_full_tog = header_full.clone();
     let state_for_preview = state.clone();
     selection.connect_selection_changed(move |sel, _pos, _n| {
         if let Some(obj) = sel.selected_item()
@@ -404,21 +414,19 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
                 }
             }
 
-            pl.from_label.set_text(&node.sender());
+            let from_full = node.sender();
             let to_full = node.to_addrs();
-            pl.to_label.set_text(&truncate_addr(&to_full));
-            if to_full.len() > 120 {
-                pl.to_label.set_tooltip_text(Some(&to_full));
-            } else {
-                pl.to_label.set_tooltip_text(None);
-            }
             let cc_full = node.cc_addrs();
-            pl.cc_label.set_text(&truncate_addr(&cc_full));
-            if cc_full.len() > 120 {
-                pl.cc_label.set_tooltip_text(Some(&cc_full));
-            } else {
-                pl.cc_label.set_tooltip_text(None);
-            }
+            let expanded = pl.expand_toggle.is_active();
+            apply_header_field(&pl.from_label, &from_full, expanded);
+            apply_header_field(&pl.to_label, &to_full, expanded);
+            apply_header_field(&pl.cc_label, &cc_full, expanded);
+            // Offer the toggle only when something is actually clipped.
+            let has_long = from_full.len() > HEADER_TRUNCATE_MAX
+                || to_full.len() > HEADER_TRUNCATE_MAX
+                || cc_full.len() > HEADER_TRUNCATE_MAX;
+            pl.expand_toggle.set_visible(has_long);
+            *header_full_sel.borrow_mut() = (from_full, to_full, cc_full);
             pl.subject_label.set_text(&node.subject());
             pl.date_label.set_text(&node.last_reply());
 
@@ -435,9 +443,20 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
         pl.to_label.set_tooltip_text(None);
         pl.cc_label.set_text("");
         pl.cc_label.set_tooltip_text(None);
+        pl.expand_toggle.set_visible(false);
         pl.subject_label.set_text("");
         pl.date_label.set_text("");
+        *header_full_sel.borrow_mut() = (String::new(), String::new(), String::new());
         set_body_with_highlight(&pl.body_buffer, "");
+    });
+
+    toggle_btn.connect_toggled(move |btn| {
+        let expanded = btn.is_active();
+        btn.set_icon_name(header_toggle_icon(expanded));
+        let full = header_full_tog.borrow();
+        apply_header_field(&toggle_from, &full.0, expanded);
+        apply_header_field(&toggle_to, &full.1, expanded);
+        apply_header_field(&toggle_cc, &full.2, expanded);
     });
 
     // ── Track the currently selected node for Reply ────────────
@@ -1440,6 +1459,8 @@ pub(crate) struct PreviewLabels {
     pub subject_label: Label,
     pub date_label: Label,
     pub body_buffer: sv::Buffer,
+    /// Reveals the full From/To/Cc when they are truncated.
+    pub expand_toggle: ToggleButton,
 }
 
 /// Build the centre pane, returning the root widget, the selection model
@@ -1447,6 +1468,7 @@ pub(crate) struct PreviewLabels {
 fn build_center_pane(
     root_model: &ListStore,
     is_dark: bool,
+    expand_headers: bool,
 ) -> (Box, SingleSelection, ColumnView, PreviewLabels, SearchEntry) {
     let vbox = Box::new(Orientation::Vertical, 0);
 
@@ -1499,6 +1521,14 @@ fn build_center_pane(
     // Placeholder: no language, no highlighting
     body_buffer.set_language(None);
 
+    let expand_toggle = ToggleButton::new();
+    expand_toggle.set_icon_name(header_toggle_icon(expand_headers));
+    expand_toggle.set_tooltip_text(Some("Show full From/To/Cc"));
+    expand_toggle.add_css_class("flat");
+    expand_toggle.set_valign(Align::Start);
+    expand_toggle.set_visible(false);
+    expand_toggle.set_active(expand_headers);
+
     let preview_labels = PreviewLabels {
         from_label,
         to_label,
@@ -1506,6 +1536,7 @@ fn build_center_pane(
         subject_label,
         date_label,
         body_buffer,
+        expand_toggle,
     };
 
     (vbox, selection, column_view, preview_labels, search)
@@ -1727,6 +1758,9 @@ fn build_preview_pane(labels: &PreviewLabels) -> Box {
     add_row(&headers, 3, "Subject", &labels.subject_label);
     add_row(&headers, 4, "Date", &labels.date_label);
 
+    // Right of the From/To/Cc rows it controls (col 2, spanning rows 0..3).
+    headers.attach(&labels.expand_toggle, 2, 0, 1, 3);
+
     vbox.append(&headers);
 
     // ── Separator ────────────────────────────────────────────
@@ -1777,14 +1811,48 @@ fn make_header_key(text: &str) -> Label {
     label
 }
 
+/// Length past which a From/To/Cc value is truncated in the collapsed view.
+const HEADER_TRUNCATE_MAX: usize = 120;
+
 fn truncate_addr(s: &str) -> String {
-    const MAX: usize = 120;
-    if s.len() <= MAX {
+    if s.len() <= HEADER_TRUNCATE_MAX {
         s.to_string()
     } else {
         // Find the last separator before the limit to avoid cutting mid-address
-        let cut = s[..MAX].rfind(',').map(|i| i + 1).unwrap_or(MAX);
+        let cut = s[..HEADER_TRUNCATE_MAX]
+            .rfind(',')
+            .map(|i| i + 1)
+            .unwrap_or(HEADER_TRUNCATE_MAX);
         format!("{}…", &s[..cut])
+    }
+}
+
+fn header_toggle_icon(expanded: bool) -> &'static str {
+    if expanded {
+        "pan-up-symbolic"
+    } else {
+        "pan-down-symbolic"
+    }
+}
+
+/// Fully wrapped when `expanded`, otherwise a single ellipsised line capped
+/// at `HEADER_TRUNCATE_MAX` with the full text in a tooltip.
+fn apply_header_field(label: &Label, full: &str, expanded: bool) {
+    if expanded {
+        label.set_ellipsize(gtk4::pango::EllipsizeMode::None);
+        label.set_wrap(true);
+        label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+        label.set_text(full);
+        label.set_tooltip_text(None);
+    } else {
+        label.set_wrap(false);
+        label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        label.set_text(&truncate_addr(full));
+        if full.len() > HEADER_TRUNCATE_MAX {
+            label.set_tooltip_text(Some(full));
+        } else {
+            label.set_tooltip_text(None);
+        }
     }
 }
 

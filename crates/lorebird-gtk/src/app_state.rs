@@ -89,6 +89,9 @@ pub struct AppState {
     /// the GTK Xft DPI to adjust for HiDPI / broken environments.
     pub ui_scale: f64,
 
+    /// Show full From/To/Cc headers by default (config `expand_headers`).
+    pub expand_headers: bool,
+
     /// Followed series (persisted to follows.json), shown in the sidebar
     /// and optionally merged into the inbox view.
     pub follows: RefCell<Vec<Follow>>,
@@ -113,6 +116,7 @@ impl AppState {
                     theme: "light".to_string(),
                     ui_scale: 1.0,
                     working_set_limit: lorebird_lua::DEFAULT_WORKING_SET_LIMIT,
+                    expand_headers: false,
                     has_on_reply: false,
                     has_on_send: false,
                 }
@@ -135,6 +139,7 @@ impl AppState {
             has_on_send: init.has_on_send,
             theme: init.theme,
             ui_scale: init.ui_scale,
+            expand_headers: init.expand_headers,
             follows: RefCell::new(lorebird_core::follows::load()),
             active_is_inbox: Cell::new(false),
         }

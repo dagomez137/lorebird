@@ -52,6 +52,7 @@ pub enum LuaResult {
         theme: String,
         ui_scale: f64,
         working_set_limit: usize,
+        expand_headers: bool,
         has_on_reply: bool,
         has_on_send: bool,
     },
@@ -97,6 +98,7 @@ pub struct InitResult {
     pub theme: String,
     pub ui_scale: f64,
     pub working_set_limit: usize,
+    pub expand_headers: bool,
     pub has_on_reply: bool,
     pub has_on_send: bool,
 }
@@ -129,7 +131,7 @@ impl LuaThread {
     /// Block until the Lua thread has loaded config.
     pub fn recv_init(&self) -> Result<InitResult, String> {
         match self.result_rx.recv() {
-            Ok(LuaResult::InitDone { profiles, theme, ui_scale, working_set_limit, has_on_reply, has_on_send }) => Ok(InitResult { profiles, theme, ui_scale, working_set_limit, has_on_reply, has_on_send }),
+            Ok(LuaResult::InitDone { profiles, theme, ui_scale, working_set_limit, expand_headers, has_on_reply, has_on_send }) => Ok(InitResult { profiles, theme, ui_scale, working_set_limit, expand_headers, has_on_reply, has_on_send }),
             Ok(LuaResult::InitFailed { error }) => Err(error),
             Ok(_) => Err("unexpected result from Lua thread".to_string()),
             Err(_) => Err("Lua thread disconnected during init".to_string()),
@@ -168,9 +170,10 @@ fn lua_thread_main(
             let theme = state.config.config.theme.clone();
             let ui_scale = state.config.config.ui_scale;
             let working_set_limit = state.config.config.working_set_limit;
+            let expand_headers = state.config.config.expand_headers;
             let has_on_reply = state.config.global_hooks.on_reply.is_some();
             let has_on_send = state.config.global_hooks.on_send.is_some();
-            let _ = result_tx.send(LuaResult::InitDone { profiles, theme, ui_scale, working_set_limit, has_on_reply, has_on_send });
+            let _ = result_tx.send(LuaResult::InitDone { profiles, theme, ui_scale, working_set_limit, expand_headers, has_on_reply, has_on_send });
             state
         }
         Err(e) => {
@@ -333,7 +336,7 @@ fn handle_fetch(
 fn empty_config() -> LoadedConfig {
     use lorebird_lua::{AppConfig, GlobalHooks, DEFAULT_WORKING_SET_LIMIT};
     LoadedConfig {
-        config: AppConfig { user: None, theme: "light".to_string(), ui_scale: 1.0, working_set_limit: DEFAULT_WORKING_SET_LIMIT, profiles: HashMap::new() },
+        config: AppConfig { user: None, theme: "light".to_string(), ui_scale: 1.0, working_set_limit: DEFAULT_WORKING_SET_LIMIT, expand_headers: false, profiles: HashMap::new() },
         profile_hooks: HashMap::new(),
         global_hooks: GlobalHooks { on_reply: None, on_send: None },
     }

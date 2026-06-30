@@ -75,6 +75,10 @@ pub struct AppConfig {
     /// cache build. Defaults to [`DEFAULT_WORKING_SET_LIMIT`].
     #[serde(default = "default_working_set_limit")]
     pub working_set_limit: usize,
+    /// Show full From/To/Cc in the preview by default instead of truncating
+    /// long recipient lists behind the expand toggle.
+    #[serde(default)]
+    pub expand_headers: bool,
     pub profiles: HashMap<String, ProfileData>,
 }
 
@@ -264,6 +268,7 @@ mod tests {
             theme: "light".to_string(),
             ui_scale: 1.0,
             working_set_limit: DEFAULT_WORKING_SET_LIMIT,
+            expand_headers: false,
             profiles: {
                 let mut m = HashMap::new();
                 m.insert(
