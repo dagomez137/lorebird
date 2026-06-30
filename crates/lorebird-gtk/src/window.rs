@@ -4,7 +4,7 @@
 //! as a header with "All Mail" and its views underneath. Clicking a
 //! row sets the active profile (and optionally the view query).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
@@ -39,6 +39,23 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     let is_dark = state_ref.theme == "dark";
     if let Some(settings) = gtk4::Settings::default() {
         settings.set_gtk_application_prefer_dark_theme(is_dark);
+    }
+
+    // Subtle whole-thread tint, kept distinct from the selection blue (which
+    // the one selected row keeps) and the hover grey; lighter on dark.
+    let tint = if is_dark {
+        "rgba(120, 170, 255, 0.14)"
+    } else {
+        "rgba(53, 132, 228, 0.12)"
+    };
+    let css = gtk4::CssProvider::new();
+    css.load_from_data(&format!(".thread-active {{ background-color: {tint}; }}"));
+    if let Some(display) = gtk4::gdk::Display::default() {
+        gtk4::style_context_add_provider_for_display(
+            &display,
+            &css,
+            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
     }
 
     let window = ApplicationWindow::builder()
@@ -115,7 +132,7 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     outer_paned.set_shrink_start_child(false);
 
     // Center + preview
-    let (center, selection, column_view, preview_labels, search_entry) =
+    let (center, selection, column_view, preview_labels, search_entry, expand_guard) =
         build_center_pane(&state_ref.root_model, is_dark, state_ref.expand_headers);
     inner_paned.set_start_child(Some(&center));
     inner_paned.set_shrink_start_child(false);
@@ -476,6 +493,59 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
             *selected_node_clone.borrow_mut() = None;
             reply_btn_ref.set_sensitive(false);
         }
+    });
+
+    // ── Whole-thread tint + accordion expansion ────────────────────
+    let active_thread_root: Rc<RefCell<Option<ThreadNode>>> = Rc::new(RefCell::new(None));
+    let expanded_root: Rc<RefCell<Option<TreeListRow>>> = Rc::new(RefCell::new(None));
+    let in_select_handler: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    let guard_for_select = expand_guard.clone();
+    selection.connect_selection_changed(move |sel, _pos, _n| {
+        // Collapsing rows can shift the selected position and re-emit this
+        // signal; ignore the re-entry so our mutations stay coherent.
+        if in_select_handler.get() {
+            return;
+        }
+        in_select_handler.set(true);
+
+        let selected_row = sel.selected_item().and_downcast::<TreeListRow>();
+
+        // Tint the whole conversation.
+        let new_root_node = selected_row
+            .as_ref()
+            .map(root_row_of)
+            .and_then(|r| r.item().and_downcast::<ThreadNode>());
+        {
+            let mut cur = active_thread_root.borrow_mut();
+            if *cur != new_root_node {
+                if let Some(old) = cur.as_ref() {
+                    set_subtree_active(old, false);
+                }
+                if let Some(new) = new_root_node.as_ref() {
+                    set_subtree_active(new, true);
+                }
+                *cur = new_root_node;
+            }
+        }
+
+        // Accordion: expand the clicked top-level thread, collapse the last.
+        if let Some(row) = selected_row.as_ref()
+            && row.parent().is_none()
+            && row.is_expandable()
+        {
+            let already = expanded_root.borrow().as_ref() == Some(row);
+            if !already {
+                guard_for_select.set(true);
+                if let Some(old) = expanded_root.borrow_mut().take() {
+                    old.set_expanded(false);
+                }
+                expand_recursive(row);
+                *expanded_root.borrow_mut() = Some(row.clone());
+                guard_for_select.set(false);
+            }
+        }
+
+        in_select_handler.set(false);
     });
 
     // ── Wire search bar ──────────────────────────────────────────
@@ -1469,7 +1539,14 @@ fn build_center_pane(
     root_model: &ListStore,
     is_dark: bool,
     expand_headers: bool,
-) -> (Box, SingleSelection, ColumnView, PreviewLabels, SearchEntry) {
+) -> (
+    Box,
+    SingleSelection,
+    ColumnView,
+    PreviewLabels,
+    SearchEntry,
+    Rc<Cell<bool>>,
+) {
     let vbox = Box::new(Orientation::Vertical, 0);
 
     // ── Search bar ────────────────────────────────────────────
@@ -1483,7 +1560,7 @@ fn build_center_pane(
     vbox.append(&search);
 
     // ── Thread list ──────────────────────────────────────────
-    let (column_view, selection) = build_thread_list(root_model);
+    let (column_view, selection, expand_guard) = build_thread_list(root_model);
 
     let scrolled = ScrolledWindow::new();
     scrolled.set_vexpand(true);
@@ -1539,12 +1616,22 @@ fn build_center_pane(
         expand_toggle,
     };
 
-    (vbox, selection, column_view, preview_labels, search)
+    (
+        vbox,
+        selection,
+        column_view,
+        preview_labels,
+        search,
+        expand_guard,
+    )
 }
 
 // ── Thread list (ColumnView + TreeListModel) ──────────────────────
 
-fn build_thread_list(root_model: &ListStore) -> (ColumnView, SingleSelection) {
+fn build_thread_list(root_model: &ListStore) -> (ColumnView, SingleSelection, Rc<Cell<bool>>) {
+    // True during a programmatic recursive expansion, so the per-row
+    // `expanded` notify handlers do not launch nested sweeps.
+    let expand_guard: Rc<Cell<bool>> = Rc::new(Cell::new(false));
     // ── Column view (created first to get its composite sorter) ──
     //
     // GTK ColumnView sorting works like this:
@@ -1569,16 +1656,25 @@ fn build_thread_list(root_model: &ListStore) -> (ColumnView, SingleSelection) {
         expander.set_child(Some(&label));
         list_item.set_child(Some(&expander));
     });
-    subject_factory.connect_bind(|_, obj| {
+    let guard_for_bind = expand_guard.clone();
+    subject_factory.connect_bind(move |_, obj| {
         let list_item = obj.downcast_ref::<ListItem>().unwrap();
         let row = list_item.item().and_downcast::<TreeListRow>().unwrap();
         let expander = list_item.child().and_downcast::<TreeExpander>().unwrap();
         expander.set_list_row(Some(&row));
-        if let Some(node) = row.item().and_downcast::<ThreadNode>()
-            && let Some(label) = expander.child().and_downcast::<Label>()
-        {
-            label.set_label(&node.subject());
+        if let Some(node) = row.item().and_downcast::<ThreadNode>() {
+            if let Some(label) = expander.child().and_downcast::<Label>() {
+                label.set_label(&node.subject());
+            }
+            install_tint(list_item, &node, &expander);
         }
+        // Make a manual arrow/keyboard expansion go full-depth too.
+        install_expand(list_item, &row, &guard_for_bind);
+    });
+    subject_factory.connect_unbind(|_, obj| {
+        let list_item = obj.downcast_ref::<ListItem>().unwrap();
+        remove_tint(list_item);
+        remove_expand(list_item);
     });
 
     let subject_col = ColumnViewColumn::new(Some("Subject"), Some(subject_factory));
@@ -1603,7 +1699,11 @@ fn build_thread_list(root_model: &ListStore) -> (ColumnView, SingleSelection) {
             && let Some(label) = list_item.child().and_downcast::<Label>()
         {
             label.set_label(&node.sender());
+            install_tint(list_item, &node, &label);
         }
+    });
+    from_factory.connect_unbind(|_, obj| {
+        remove_tint(obj.downcast_ref::<ListItem>().unwrap());
     });
 
     let from_col = ColumnViewColumn::new(Some("From"), Some(from_factory));
@@ -1627,7 +1727,11 @@ fn build_thread_list(root_model: &ListStore) -> (ColumnView, SingleSelection) {
             && let Some(label) = list_item.child().and_downcast::<Label>()
         {
             label.set_label(&node.started());
+            install_tint(list_item, &node, &label);
         }
+    });
+    started_factory.connect_unbind(|_, obj| {
+        remove_tint(obj.downcast_ref::<ListItem>().unwrap());
     });
 
     // Sorters compare ThreadNode items — ColumnView unwraps
@@ -1665,7 +1769,11 @@ fn build_thread_list(root_model: &ListStore) -> (ColumnView, SingleSelection) {
             && let Some(label) = list_item.child().and_downcast::<Label>()
         {
             label.set_label(&node.last_reply());
+            install_tint(list_item, &node, &label);
         }
+    });
+    last_reply_factory.connect_unbind(|_, obj| {
+        remove_tint(obj.downcast_ref::<ListItem>().unwrap());
     });
 
     let last_reply_sorter = CustomSorter::new(|a, b| {
@@ -1716,19 +1824,147 @@ fn build_thread_list(root_model: &ListStore) -> (ColumnView, SingleSelection) {
     // Default sort: Last Reply descending (newest first)
     column_view.sort_by_column(Some(&last_reply_col), SortType::Descending);
 
-    // Double-click a row to expand/collapse its children
+    // Double-click toggles a non-root sub-group; top-level rows belong to the
+    // accordion, so skipping them avoids collapsing a just-expanded thread.
     column_view.connect_activate(move |cv, pos| {
-        if let Some(item) = cv.model().and_then(|m| m.item(pos)) {
-            if let Some(row) = item.downcast_ref::<TreeListRow>() {
-                if row.is_expandable() {
-                    row.set_expanded(!row.is_expanded());
-                }
-            }
+        if let Some(item) = cv.model().and_then(|m| m.item(pos))
+            && let Some(row) = item.downcast_ref::<TreeListRow>()
+            && row.is_expandable()
+            && row.parent().is_some()
+        {
+            row.set_expanded(!row.is_expanded());
         }
     });
 
-    (column_view, selection)
+    (column_view, selection, expand_guard)
 }
+
+// ── Whole-thread tint & recursive expansion helpers ───────────────
+
+/// CSS class applied to every cell child of a row in the selected thread.
+const THREAD_TINT_CLASS: &str = "thread-active";
+/// `list_item` data key holding the tint `notify` handler and its node.
+const TINT_HANDLER_KEY: &str = "lb-tint-handler";
+/// `list_item` data key holding the `expanded` notify handler and its row.
+const EXPAND_HANDLER_KEY: &str = "lb-expand-handler";
+
+/// Top-level row of the thread containing `row`.
+fn root_row_of(row: &TreeListRow) -> TreeListRow {
+    let mut cur = row.clone();
+    while let Some(parent) = cur.parent() {
+        cur = parent;
+    }
+    cur
+}
+
+/// Flag `node`'s whole subtree active or not. Runs on the persistent model
+/// objects, so it is unaffected by which rows are expanded or realised.
+fn set_subtree_active(node: &ThreadNode, active: bool) {
+    node.set_in_selected_thread(active);
+    if !node.has_children() {
+        return;
+    }
+    let children = node.children_store();
+    for i in 0..children.n_items() {
+        if let Some(child) = children.item(i).and_downcast::<ThreadNode>() {
+            set_subtree_active(&child, active);
+        }
+    }
+}
+
+/// Expand `row` and every descendant. `children()` yields the underlying
+/// model items, not rows, so `child_row` is used to reach each descendant
+/// `TreeListRow`; children materialise lazily once `row` is expanded.
+fn expand_recursive(row: &TreeListRow) {
+    if !row.is_expandable() {
+        return;
+    }
+    if !row.is_expanded() {
+        row.set_expanded(true);
+    }
+    let mut i = 0;
+    while let Some(child) = row.child_row(i) {
+        expand_recursive(&child);
+        i += 1;
+    }
+}
+
+fn set_thread_tint(widget: &impl glib::object::IsA<gtk4::Widget>, active: bool) {
+    // Tint the cell (the child's parent) so the whole field colours, not just
+    // the text the label paints over its own allocation.
+    let target = widget.parent().unwrap_or_else(|| widget.as_ref().clone());
+    if active {
+        target.add_css_class(THREAD_TINT_CLASS);
+    } else {
+        target.remove_css_class(THREAD_TINT_CLASS);
+    }
+}
+
+/// Tint `widget` now and on every change, via a `notify` handler stashed on
+/// the list item. Cleanup on unbind matters because recycled widgets would
+/// otherwise leak the handler and tint the wrong row.
+fn install_tint<W>(list_item: &ListItem, node: &ThreadNode, widget: &W)
+where
+    W: glib::object::IsA<gtk4::Widget> + Clone + 'static,
+{
+    remove_tint(list_item);
+    set_thread_tint(widget, node.in_selected_thread());
+    let w = widget.clone();
+    let handler = node.connect_in_selected_thread_notify(move |n| {
+        set_thread_tint(&w, n.in_selected_thread());
+    });
+    // SAFETY: list items are created and accessed only on the GTK main
+    // thread, and this key is always paired with this value type.
+    unsafe {
+        list_item.set_data(TINT_HANDLER_KEY, (node.clone(), handler));
+    }
+}
+
+fn remove_tint(list_item: &ListItem) {
+    // SAFETY: see install_tint; same key and value type.
+    unsafe {
+        if let Some((node, handler)) =
+            list_item.steal_data::<(ThreadNode, glib::SignalHandlerId)>(TINT_HANDLER_KEY)
+        {
+            node.disconnect(handler);
+        }
+    }
+}
+
+/// Connect an `expanded` notify so a manual expansion of `row` cascades
+/// full-depth. Removed on unbind to avoid leaking across widget recycling.
+fn install_expand(list_item: &ListItem, row: &TreeListRow, guard: &Rc<Cell<bool>>) {
+    remove_expand(list_item);
+    let g = guard.clone();
+    let handler = row.connect_expanded_notify(move |row| {
+        // Suppress while a programmatic sweep is already running.
+        if g.get() {
+            return;
+        }
+        if row.is_expanded() {
+            g.set(true);
+            expand_recursive(row);
+            g.set(false);
+        }
+    });
+    // SAFETY: list items are accessed only on the GTK main thread, and this
+    // key is always paired with this value type.
+    unsafe {
+        list_item.set_data(EXPAND_HANDLER_KEY, (row.clone(), handler));
+    }
+}
+
+fn remove_expand(list_item: &ListItem) {
+    // SAFETY: see install_expand; same key and value type.
+    unsafe {
+        if let Some((row, handler)) =
+            list_item.steal_data::<(TreeListRow, glib::SignalHandlerId)>(EXPAND_HANDLER_KEY)
+        {
+            row.disconnect(handler);
+        }
+    }
+}
+
 fn build_preview_pane(labels: &PreviewLabels) -> Box {
     let vbox = Box::new(Orientation::Vertical, 0);
     vbox.set_margin_top(8);

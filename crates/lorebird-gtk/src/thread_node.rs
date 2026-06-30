@@ -44,6 +44,10 @@ mod imp {
         last_reply_ts: Cell<i64>,
         #[property(get, set)]
         has_children: Cell<bool>,
+        /// Set while this node is part of the selected conversation; drives
+        /// the whole-thread tint.
+        #[property(get, set)]
+        in_selected_thread: Cell<bool>,
         #[property(get, set)]
         body_preview: RefCell<String>,
         /// The Message-ID header of this message (for In-Reply-To).
