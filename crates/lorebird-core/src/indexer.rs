@@ -10,6 +10,7 @@
 //! SELECT per message.
 
 use rusqlite::{params, Connection, Result as SqlResult};
+use std::collections::HashSet;
 use std::path::Path;
 
 use crate::message::MailMessage;
@@ -72,6 +73,27 @@ fn index_maildir_inner(conn: &Connection, maildir_path: &Path) -> SqlResult<usiz
 
     let mut inserted = 0usize;
 
+    // Fast pre-filter: load every already-indexed filename into memory so we
+    // can skip the expensive `fs::read` + `MailMessage::from_bytes` parse for
+    // files we've seen before.  The `filename` column stores the stable
+    // relative path (basename with the maildir `:2,FLAGS` suffix stripped),
+    // which is exactly the `rel_path` we reconstruct per file below — so the
+    // membership test matches what `INSERT OR IGNORE` would dedup on.
+    //
+    // This one query is cheap relative to parsing hundreds of thousands of
+    // messages.  The `INSERT OR IGNORE` further down remains the authoritative
+    // dedup (it still protects against races / correctness); this set is purely
+    // a performance pre-filter.  Each file is visited at most once per run, so
+    // we don't need to insert newly indexed paths back into the set.
+    let mut indexed: HashSet<String> = HashSet::new();
+    {
+        let mut stmt = conn.prepare("SELECT filename FROM mail_ndx")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        for f in rows {
+            indexed.insert(f?);
+        }
+    }
+
     for subdir in &["cur", "new"] {
         let dir = maildir_path.join(subdir);
         if !dir.is_dir() {
@@ -90,6 +112,13 @@ fn index_maildir_inner(conn: &Connection, maildir_path: &Path) -> SqlResult<usiz
                 .unwrap_or(&file_path)
                 .to_string_lossy()
                 .to_string();
+
+            // Pre-filter: skip files already indexed under this stable rel_path
+            // BEFORE reading + parsing them.  This turns re-indexing cost from
+            // O(total maildir size) into O(new files).
+            if indexed.contains(&rel_path) {
+                continue;
+            }
 
             let raw = match std::fs::read(&file_path) {
                 Ok(b) => b,
@@ -189,5 +218,77 @@ mod tests {
         }
         let n = index_maildir(&conn, tmp.path()).unwrap();
         assert_eq!(n, 0);
+    }
+
+    /// Write a minimal valid message (needs a Message-ID) into `<maildir>/cur`.
+    fn write_msg(maildir: &Path, basename: &str, flags: &str, msg_id: &str) {
+        let name = format!("{basename}:2,{flags}");
+        let body = format!(
+            "From: a@b.com\r\nSubject: Hi\r\nMessage-ID: <{msg_id}>\r\n\r\nhello"
+        );
+        std::fs::write(maildir.join("cur").join(name), body).unwrap();
+    }
+
+    #[test]
+    fn prefilter_only_indexes_new_files() {
+        let conn = Connection::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        for sub in &["cur", "new", "tmp"] {
+            std::fs::create_dir_all(tmp.path().join(sub)).unwrap();
+        }
+
+        // First pass: two messages, both new.
+        write_msg(tmp.path(), "1700000000.aaa.host", "S", "m1@x");
+        write_msg(tmp.path(), "1700000001.bbb.host", "S", "m2@x");
+        let n1 = index_maildir(&conn, tmp.path()).unwrap();
+        assert_eq!(n1, 2, "first run should index both new messages");
+
+        // Add one genuinely new message, then re-index.
+        write_msg(tmp.path(), "1700000002.ccc.host", "S", "m3@x");
+        let n2 = index_maildir(&conn, tmp.path()).unwrap();
+        assert_eq!(
+            n2, 1,
+            "second run must index exactly the 1 new file, skipping the 2 already-indexed"
+        );
+
+        // mail_ndx holds 3 rows; mail_fts likewise — no duplicates created.
+        let ndx_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM mail_ndx", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ndx_count, 3);
+        let fts_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM mail_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fts_count, 3);
+    }
+
+    /// A flag change on an already-indexed file (same stable basename, new
+    /// `:2,FLAGS` suffix) must NOT be re-indexed: the stable rel_path is what
+    /// the pre-filter and the UNIQUE constraint both key on.
+    #[test]
+    fn prefilter_ignores_flag_changes() {
+        let conn = Connection::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        for sub in &["cur", "new", "tmp"] {
+            std::fs::create_dir_all(tmp.path().join(sub)).unwrap();
+        }
+
+        write_msg(tmp.path(), "1700000000.aaa.host", "S", "m1@x");
+        assert_eq!(index_maildir(&conn, tmp.path()).unwrap(), 1);
+
+        // Rename to a different flag set (e.g. mark replied) — same stable base.
+        std::fs::remove_file(tmp.path().join("cur").join("1700000000.aaa.host:2,S"))
+            .unwrap();
+        write_msg(tmp.path(), "1700000000.aaa.host", "RS", "m1@x");
+
+        assert_eq!(
+            index_maildir(&conn, tmp.path()).unwrap(),
+            0,
+            "flag-only change keeps the same stable rel_path and must be skipped"
+        );
+        let ndx_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM mail_ndx", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ndx_count, 1);
     }
 }
