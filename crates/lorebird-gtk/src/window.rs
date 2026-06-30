@@ -147,22 +147,26 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     inner_paned.set_shrink_start_child(false);
 
     let preview = build_preview_pane(&preview_labels);
-    // Default the reading pane to `reading_pane_columns` of monospace text.
-    // resize_end_child(false) keeps it at that width while the thread list
-    // takes the slack on resize; shrink stays on so the divider drags in.
+    // The reading pane opens at `reading_pane_columns` of monospace text and
+    // can be dragged down to a small floor. Both panes have a hard minimum
+    // width with shrink disabled, so neither can be squeezed away and the
+    // window cannot shrink small enough to overflow.
     let cols = state_ref.reading_pane_columns.clamp(40, 400) as i32;
-    let preview_px = reading_pane_width_px(&window, cols);
-    preview.set_width_request(preview_px);
+    let default_px = reading_pane_width_px(&window, cols);
+    let min_px = reading_pane_width_px(&window, cols.min(READING_PANE_MIN_COLUMNS));
+    preview.set_width_request(min_px);
     inner_paned.set_end_child(Some(&preview));
     inner_paned.set_resize_start_child(true);
     inner_paned.set_resize_end_child(false);
-    inner_paned.set_shrink_end_child(true);
+    inner_paned.set_shrink_end_child(false);
+    center.set_width_request(THREAD_LIST_MIN_WIDTH);
 
     outer_paned.set_end_child(Some(&inner_paned));
     outer_paned.set_position(SIDEBAR_WIDTH);
-    // Size the window so the sidebar, a usable thread list and the reading
-    // pane all fit without crowding.
-    window.set_default_size(SIDEBAR_WIDTH + 520 + preview_px, 760);
+    // Open the split with the reading pane at its full column width and a
+    // usable list beside it, and size the window to match.
+    inner_paned.set_position(THREAD_LIST_DEFAULT_WIDTH);
+    window.set_default_size(SIDEBAR_WIDTH + THREAD_LIST_DEFAULT_WIDTH + default_px, 760);
     outer_paned.set_vexpand(true);
     outer_paned.set_hexpand(true);
 
@@ -2074,6 +2078,14 @@ const HEADER_TRUNCATE_MAX: usize = 120;
 
 /// Default width of the folder sidebar, in pixels.
 const SIDEBAR_WIDTH: i32 = 168;
+
+/// Narrowest the reading pane can be dragged, in monospace columns.
+const READING_PANE_MIN_COLUMNS: i32 = 60;
+
+/// Minimum width of the thread list, in pixels, so it cannot be squeezed away.
+const THREAD_LIST_MIN_WIDTH: i32 = 320;
+/// Default width of the thread list when the window first opens, in pixels.
+const THREAD_LIST_DEFAULT_WIDTH: i32 = 520;
 
 /// Pixel width that fits `columns` monospace characters in the reading pane,
 /// with an allowance for the body's line-number gutter, margins and scrollbar.
