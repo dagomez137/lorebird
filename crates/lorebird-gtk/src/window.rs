@@ -1698,7 +1698,9 @@ fn build_thread_list(root_model: &ListStore) -> (ColumnView, SingleSelection, Rc
         let label = Label::new(None);
         label.set_xalign(0.0);
         label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-        label.set_width_chars(18);
+        // Keep From tight so the Subject column, which holds the tree indent
+        // and truncates first on deep threads, keeps the width.
+        label.set_width_chars(12);
         label.add_css_class("dim-label");
         list_item.set_child(Some(&label));
     });
@@ -1717,6 +1719,7 @@ fn build_thread_list(root_model: &ListStore) -> (ColumnView, SingleSelection, Rc
     });
 
     let from_col = ColumnViewColumn::new(Some("From"), Some(from_factory));
+    from_col.set_resizable(true);
     column_view.append_column(&from_col);
 
     // — Column: Started ──────────────────────────────────────
