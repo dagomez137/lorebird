@@ -74,6 +74,7 @@ Field prefixes: `s:`/`subject`, `f:`/`from`, `b:`/`body`, `to:`, `cc:`, `l:`/`li
 - Avoid the em-dash and en-dash appositive style in all prose, including code comments, docs, and commit messages. Rewrite such constructions as separate sentences, or use a colon, a semicolon, or parentheses instead. Box-drawing dividers in code are fine; this rule is about em and en dashes inside sentences.
 - Distinguish a tool's project name from its command. Name the project in plain text with its canonical spelling (SQLite, GTK, GtkSourceView, Lua, Nix, Xapian, Anubis) and backtick the executable you run (`cargo`, `sqlite3`, `nix`, `lua`). Backtick code identifiers, file paths, query operators (`is:archived`, `l:`, `rt:`), and SQL.
 - Use the modern unified `nix` CLI (`nix build`, `nix develop`, `nix flake check`), never the classic `nix-*` binaries.
+- Comment only what the code cannot say for itself. Skip comments and doc comments that restate what an obvious name or line already conveys; reserve them for the non-obvious: the why, an invariant, a subtle ordering or lifetime, a safety justification. Trim docs to the complex or surprising cases. Put the rationale for a change (the why, and the how when it is intricate) in the commit message, not as narration in the source.
 
 ## Commit rules
 
