@@ -630,7 +630,10 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
             Ok(n) => {
                 status_for_archive.set_text(&format!("Archived {} message(s)", n));
                 spinner_for_archive.set_spinning(true);
-                let _ = s.rerun_active_view();
+                if let Err(e) = s.rerun_active_view() {
+                    spinner_for_archive.set_spinning(false);
+                    status_for_archive.set_text(&format!("Archive refresh failed: {}", e));
+                }
             }
             Err(e) => status_for_archive.set_text(&format!("Archive failed: {}", e)),
         }
@@ -654,7 +657,10 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
             Ok(n) => {
                 status_for_unarchive.set_text(&format!("Unarchived {} message(s)", n));
                 spinner_for_unarchive.set_spinning(true);
-                let _ = s.rerun_active_view();
+                if let Err(e) = s.rerun_active_view() {
+                    spinner_for_unarchive.set_spinning(false);
+                    status_for_unarchive.set_text(&format!("Unarchive refresh failed: {}", e));
+                }
             }
             Err(e) => status_for_unarchive.set_text(&format!("Unarchive failed: {}", e)),
         }
@@ -1336,7 +1342,12 @@ fn open_follow_dialog(
                 let q = s.augment_inbox_query(&base);
                 spinner_c.set_spinning(true);
                 let profile = s.active_profile.borrow().clone();
-                let _ = s.request_search(q, PendingDesc::View { name: "inbox".to_string(), profile });
+                if let Err(e) =
+                    s.request_search(q, PendingDesc::View { name: "inbox".to_string(), profile })
+                {
+                    spinner_c.set_spinning(false);
+                    status_c.set_text(&format!("Inbox refresh failed: {}", e));
+                }
             }
         }
         drop(s);
