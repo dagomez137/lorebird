@@ -84,6 +84,10 @@ pub struct AppConfig {
     /// and a 75-column commit log without wrapping. The divider stays draggable.
     #[serde(default = "default_reading_pane_columns")]
     pub reading_pane_columns: usize,
+    /// Tighten the thread list: drop the inter-row spacing for a denser,
+    /// subject-focused list. Off by default (the roomier two-line layout).
+    #[serde(default)]
+    pub compact_list: bool,
     pub profiles: HashMap<String, ProfileData>,
 }
 
@@ -282,6 +286,7 @@ mod tests {
             working_set_limit: DEFAULT_WORKING_SET_LIMIT,
             expand_headers: false,
             reading_pane_columns: DEFAULT_READING_PANE_COLUMNS,
+            compact_list: false,
             profiles: {
                 let mut m = HashMap::new();
                 m.insert(

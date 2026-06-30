@@ -96,6 +96,9 @@ pub struct AppState {
     /// `reading_pane_columns`).
     pub reading_pane_columns: usize,
 
+    /// Tighten the thread list rows (config `compact_list`).
+    pub compact_list: bool,
+
     /// Followed series (persisted to follows.json), shown in the sidebar
     /// and optionally merged into the inbox view.
     pub follows: RefCell<Vec<Follow>>,
@@ -122,6 +125,7 @@ impl AppState {
                     working_set_limit: lorebird_lua::DEFAULT_WORKING_SET_LIMIT,
                     expand_headers: false,
                     reading_pane_columns: lorebird_lua::DEFAULT_READING_PANE_COLUMNS,
+                    compact_list: false,
                     has_on_reply: false,
                     has_on_send: false,
                 }
@@ -146,6 +150,7 @@ impl AppState {
             ui_scale: init.ui_scale,
             expand_headers: init.expand_headers,
             reading_pane_columns: init.reading_pane_columns,
+            compact_list: init.compact_list,
             follows: RefCell::new(lorebird_core::follows::load()),
             active_is_inbox: Cell::new(false),
         }

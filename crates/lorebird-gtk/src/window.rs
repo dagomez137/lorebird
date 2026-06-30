@@ -168,6 +168,7 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
             is_dark,
             state_ref.expand_headers,
             &meta_toggle,
+            state_ref.compact_list,
         );
     let lore_btn = preview_labels.lore_btn.clone();
     inner_paned.set_start_child(Some(&center));
@@ -1623,6 +1624,7 @@ fn build_center_pane(
     is_dark: bool,
     expand_headers: bool,
     meta_toggle: &ToggleButton,
+    compact: bool,
 ) -> (
     Box,
     SingleSelection,
@@ -1644,7 +1646,8 @@ fn build_center_pane(
     vbox.append(&search);
 
     // ── Thread list ──────────────────────────────────────────
-    let (thread_view, selection, expand_guard) = build_thread_list(root_model, meta_toggle);
+    let (thread_view, selection, expand_guard) =
+        build_thread_list(root_model, meta_toggle, compact);
 
     let scrolled = ScrolledWindow::new();
     scrolled.set_vexpand(true);
@@ -1752,10 +1755,13 @@ fn meta_line(node: &ThreadNode) -> String {
 fn build_thread_list(
     root_model: &ListStore,
     meta_toggle: &ToggleButton,
+    compact: bool,
 ) -> (ListView, SingleSelection, Rc<Cell<bool>>) {
     // True during a programmatic recursive expansion, so the per-row
     // `expanded` notify handlers do not launch nested sweeps.
     let expand_guard: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    // Row padding: tighter when compact.
+    let row_pad = if compact { 0 } else { 2 };
 
     // ── Single card-style factory ────────────────────────────
     // Each row is a TreeExpander (keeps the tree indent and arrows) wrapping a
@@ -1770,10 +1776,10 @@ fn build_thread_list(
         let list_item = obj.downcast_ref::<ListItem>().unwrap();
         let expander = TreeExpander::new();
 
-        let vbox = Box::new(Orientation::Vertical, 2);
+        let vbox = Box::new(Orientation::Vertical, row_pad);
         vbox.set_hexpand(true);
-        vbox.set_margin_top(2);
-        vbox.set_margin_bottom(2);
+        vbox.set_margin_top(row_pad);
+        vbox.set_margin_bottom(row_pad);
 
         // Subject: full width, wraps to at most two lines, then ellipsises.
         // WordChar wrap keeps the reported minimum width tiny so the row never

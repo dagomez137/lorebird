@@ -54,6 +54,7 @@ pub enum LuaResult {
         working_set_limit: usize,
         expand_headers: bool,
         reading_pane_columns: usize,
+        compact_list: bool,
         has_on_reply: bool,
         has_on_send: bool,
     },
@@ -101,6 +102,7 @@ pub struct InitResult {
     pub working_set_limit: usize,
     pub expand_headers: bool,
     pub reading_pane_columns: usize,
+    pub compact_list: bool,
     pub has_on_reply: bool,
     pub has_on_send: bool,
 }
@@ -133,7 +135,7 @@ impl LuaThread {
     /// Block until the Lua thread has loaded config.
     pub fn recv_init(&self) -> Result<InitResult, String> {
         match self.result_rx.recv() {
-            Ok(LuaResult::InitDone { profiles, theme, ui_scale, working_set_limit, expand_headers, reading_pane_columns, has_on_reply, has_on_send }) => Ok(InitResult { profiles, theme, ui_scale, working_set_limit, expand_headers, reading_pane_columns, has_on_reply, has_on_send }),
+            Ok(LuaResult::InitDone { profiles, theme, ui_scale, working_set_limit, expand_headers, reading_pane_columns, compact_list, has_on_reply, has_on_send }) => Ok(InitResult { profiles, theme, ui_scale, working_set_limit, expand_headers, reading_pane_columns, compact_list, has_on_reply, has_on_send }),
             Ok(LuaResult::InitFailed { error }) => Err(error),
             Ok(_) => Err("unexpected result from Lua thread".to_string()),
             Err(_) => Err("Lua thread disconnected during init".to_string()),
@@ -174,9 +176,10 @@ fn lua_thread_main(
             let working_set_limit = state.config.config.working_set_limit;
             let expand_headers = state.config.config.expand_headers;
             let reading_pane_columns = state.config.config.reading_pane_columns;
+            let compact_list = state.config.config.compact_list;
             let has_on_reply = state.config.global_hooks.on_reply.is_some();
             let has_on_send = state.config.global_hooks.on_send.is_some();
-            let _ = result_tx.send(LuaResult::InitDone { profiles, theme, ui_scale, working_set_limit, expand_headers, reading_pane_columns, has_on_reply, has_on_send });
+            let _ = result_tx.send(LuaResult::InitDone { profiles, theme, ui_scale, working_set_limit, expand_headers, reading_pane_columns, compact_list, has_on_reply, has_on_send });
             state
         }
         Err(e) => {
@@ -339,7 +342,7 @@ fn handle_fetch(
 fn empty_config() -> LoadedConfig {
     use lorebird_lua::{AppConfig, GlobalHooks, DEFAULT_READING_PANE_COLUMNS, DEFAULT_WORKING_SET_LIMIT};
     LoadedConfig {
-        config: AppConfig { user: None, theme: "light".to_string(), ui_scale: 1.0, working_set_limit: DEFAULT_WORKING_SET_LIMIT, expand_headers: false, reading_pane_columns: DEFAULT_READING_PANE_COLUMNS, profiles: HashMap::new() },
+        config: AppConfig { user: None, theme: "light".to_string(), ui_scale: 1.0, working_set_limit: DEFAULT_WORKING_SET_LIMIT, expand_headers: false, reading_pane_columns: DEFAULT_READING_PANE_COLUMNS, compact_list: false, profiles: HashMap::new() },
         profile_hooks: HashMap::new(),
         global_hooks: GlobalHooks { on_reply: None, on_send: None },
     }
