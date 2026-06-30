@@ -13,9 +13,16 @@
 //! Streaming design: the HTTP response is never buffered in full
 //! (except for Anubis challenge pages, which are tiny HTML).  Messages
 //! are decompressed and parsed one at a time via `MboxParser`, written
-//! to disk immediately, and deduplicated against the cache.  The read
-//! stall timeout detects genuine stalls (no bytes for N seconds), not
-//! slow but active transfers.
+//! to disk immediately, and deduplicated against the cache.
+//!
+//! Body timeout: ureq 3.3 only exposes *total* duration timeouts
+//! (`timeout_recv_body`), not a per-read idle/stall timeout, so the body
+//! timeout here is a wall-clock cap on the entire body transfer — NOT a
+//! "no bytes for N seconds" stall detector.  It is deliberately generous
+//! ([`RECV_BODY_TIMEOUT_SECS`]) so a large but healthy streamed fetch is
+//! not truncated mid-stream.  On a timeout the partial fetch is preserved
+//! (`FetchResult.timed_out`) and the next incremental run resumes from the
+//! newest `Date:` already seen.
 //!
 //! Incremental fetches use per-query `last_date` tracking: on
 //! subsequent fetches for the same query, a `dt:` range is injected
@@ -36,8 +43,14 @@ use sha2::Sha256;
 
 const BASE_URL: &str = "https://lore.kernel.org";
 const USER_AGENT: &str = "Lorefetch/1.x (https://github.com/jwdevantier/lorefetch)";
-/// Read stall timeout: if no bytes arrive for this many seconds, abort.
-const READ_TIMEOUT_SECS: u64 = 30;
+/// Total wall-clock cap on receiving the response body (ureq's
+/// `timeout_recv_body`). This is NOT an idle/stall timeout — ureq 3.3 does
+/// not expose one — so it must be large enough to stream a big (gzipped) mbox
+/// over a slow link without truncating. A full-list initial fetch can be
+/// hundreds of MB decompressed; 30s was far too short and silently truncated
+/// such fetches. 30 minutes leaves ample headroom while still bounding a
+/// genuinely dead connection.
+const RECV_BODY_TIMEOUT_SECS: u64 = 30 * 60;
 const CACHE_VERSION: i32 = 2;
 const CACHE_FILENAME: &str = ".lorefetch-cache.json";
 
@@ -74,7 +87,7 @@ pub enum LoreError {
     #[error("Response is not mbox format")]
     NotMbox,
 
-    #[error("Read timeout: no data received for {0}s")]
+    #[error("Body transfer exceeded the {0}s total timeout (partial fetch saved)")]
     ReadTimeout(u64),
 
     #[error("No results found")]
@@ -260,25 +273,22 @@ impl<R: Read> MboxParser<R> {
         }
     }
 
+    /// Read one line (including the trailing `\n`) into `line_buf`, returning
+    /// the number of bytes read (`0` at EOF). Uses the buffered reader's
+    /// `read_until` rather than a byte-at-a-time loop, so each line costs a
+    /// single buffer scan instead of one syscall-shaped read per byte.
     fn read_line(&mut self) -> Result<usize, LoreError> {
-        let mut total = 0usize;
-        let mut byte = [0u8; 1];
-        loop {
-            match self.reader.read(&mut byte) {
-                Ok(0) => return Ok(total),
-                Ok(1) => {
-                    self.line_buf.push(byte[0]);
-                    total += 1;
-                    if byte[0] == b'\n' { return Ok(total); }
-                }
-                Ok(_) => unreachable!(),
-                Err(e) => {
-                    if e.kind() == std::io::ErrorKind::TimedOut
-                        || e.to_string().contains("timed out")
-                        || e.to_string().contains("Timeout") {
-                        return Err(LoreError::ReadTimeout(READ_TIMEOUT_SECS));
-                    }
-                    return Err(LoreError::Http(format!("read error: {}", e)));
+        use std::io::BufRead;
+        match self.reader.read_until(b'\n', &mut self.line_buf) {
+            Ok(n) => Ok(n),
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::TimedOut
+                    || e.to_string().contains("timed out")
+                    || e.to_string().contains("Timeout")
+                {
+                    Err(LoreError::ReadTimeout(RECV_BODY_TIMEOUT_SECS))
+                } else {
+                    Err(LoreError::Http(format!("read error: {}", e)))
                 }
             }
         }
@@ -420,7 +430,7 @@ fn map_read_err(e: std::io::Error) -> LoreError {
         || e.to_string().contains("timed out")
         || e.to_string().contains("Timeout")
     {
-        LoreError::ReadTimeout(READ_TIMEOUT_SECS)
+        LoreError::ReadTimeout(RECV_BODY_TIMEOUT_SECS)
     } else {
         LoreError::Http(format!("reading response: {}", e))
     }
@@ -455,7 +465,7 @@ impl LoreClient {
     fn build_agent(&self) -> ureq::Agent {
         use ureq::config::Config;
         Config::builder()
-            .timeout_recv_body(Some(Duration::from_secs(READ_TIMEOUT_SECS)))
+            .timeout_recv_body(Some(Duration::from_secs(RECV_BODY_TIMEOUT_SECS)))
             // public-inbox answers a zero-result mbox download with HTTP 404;
             // we want to inspect the status ourselves rather than have ureq
             // turn every non-2xx into a transport error.
