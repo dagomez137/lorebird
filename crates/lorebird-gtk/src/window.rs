@@ -118,6 +118,15 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     // Sidebar (built from config)
     let (sidebar_scrolled, sidebar_model, sidebar_lb) = build_sidebar(&state_ref);
 
+    let sidebar_toggle = ToggleButton::new();
+    sidebar_toggle.set_icon_name("sidebar-show-symbolic");
+    sidebar_toggle.set_tooltip_text(Some("Show or hide the folder sidebar"));
+    sidebar_toggle.add_css_class("flat");
+    sidebar_toggle.set_active(true);
+    let sidebar_for_toggle = sidebar_scrolled.clone();
+    sidebar_toggle.connect_toggled(move |b| sidebar_for_toggle.set_visible(b.is_active()));
+    header.pack_start(&sidebar_toggle);
+
     // Clones of the sidebar model for live follow/unfollow mutation, and the
     // profile that followed-series rows run against (the first, alphabetically).
     let sidebar_model_for_follow = sidebar_model.clone();
@@ -2064,7 +2073,7 @@ fn make_header_key(text: &str) -> Label {
 const HEADER_TRUNCATE_MAX: usize = 120;
 
 /// Default width of the folder sidebar, in pixels.
-const SIDEBAR_WIDTH: i32 = 180;
+const SIDEBAR_WIDTH: i32 = 168;
 
 /// Pixel width that fits `columns` monospace characters in the reading pane,
 /// with an allowance for the body's line-number gutter, margins and scrollbar.
