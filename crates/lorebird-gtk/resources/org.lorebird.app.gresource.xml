@@ -11,4 +11,7 @@
   <gresource prefix="/org/lorebird/app/icons/scalable/apps">
     <file alias="org.lorebird.app.png">org.lorebird.app.256.png</file>
   </gresource>
+  <gresource prefix="/org/lorebird/app/icons/scalable/actions">
+    <file>lorebird-web-symbolic.svg</file>
+  </gresource>
 </gresources>

@@ -153,6 +153,7 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     // Center + preview
     let (center, selection, column_view, preview_labels, search_entry, expand_guard) =
         build_center_pane(&state_ref.root_model, is_dark, state_ref.expand_headers);
+    let lore_btn = preview_labels.lore_btn.clone();
     inner_paned.set_start_child(Some(&center));
     inner_paned.set_shrink_start_child(false);
 
@@ -479,6 +480,9 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
             *header_full_sel.borrow_mut() = (from_full, to_full, cc_full);
             pl.subject_label.set_text(&node.subject());
             pl.date_label.set_text(&node.last_reply());
+            let mid = node.message_id();
+            pl.message_id_label
+                .set_text(mid.trim_start_matches('<').trim_end_matches('>'));
 
             let body = node.body_preview();
             if body.is_empty() {
@@ -496,6 +500,7 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
         pl.expand_toggle.set_visible(false);
         pl.subject_label.set_text("");
         pl.date_label.set_text("");
+        pl.message_id_label.set_text("");
         *header_full_sel.borrow_mut() = (String::new(), String::new(), String::new());
         set_body_with_highlight(&pl.body_buffer, "");
     });
@@ -512,19 +517,22 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     // ── Track the currently selected node for Reply ────────────
     let selected_node_clone = selected_node.clone();
     let reply_btn_ref = reply_btn.clone();
+    let lore_btn_ref = lore_btn.clone();
     let kind_ref = active_folder_kind.clone();
     selection.connect_selection_changed(move |sel, _pos, _n| {
         if let Some(obj) = sel.selected_item()
             && let Some(row) = obj.downcast_ref::<TreeListRow>()
             && let Some(node) = row.item().and_downcast::<ThreadNode>()
         {
+            // Reply and Lore are only sensitive when viewing mail, not drafts.
+            let on_mail = !matches!(*kind_ref.borrow(), FolderKind::Drafts);
+            lore_btn_ref.set_sensitive(on_mail && !node.message_id().is_empty());
             *selected_node_clone.borrow_mut() = Some(node);
-            // Reply is only sensitive when viewing mail, not drafts.
-            reply_btn_ref
-                .set_sensitive(!matches!(*kind_ref.borrow(), FolderKind::Drafts));
+            reply_btn_ref.set_sensitive(on_mail);
         } else {
             *selected_node_clone.borrow_mut() = None;
             reply_btn_ref.set_sensitive(false);
+            lore_btn_ref.set_sensitive(false);
         }
     });
 
@@ -858,6 +866,26 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
             &status_for_reply_btn,
             is_dark,
         );
+    });
+
+    // ── Lore button: open the message on lore.kernel.org ───────────
+    let selected_for_lore = selected_node.clone();
+    let window_for_lore = window.clone();
+    lore_btn.connect_clicked(move |_| {
+        if let Some(node) = selected_for_lore.borrow().as_ref() {
+            let mid = node.message_id();
+            let mid = mid.trim_start_matches('<').trim_end_matches('>');
+            if !mid.is_empty() {
+                // /all/ resolves any list; escape the id for the URL path.
+                let escaped = glib::Uri::escape_string(mid, Some("@"), false);
+                let url = format!("https://lore.kernel.org/all/{}/", escaped);
+                gtk4::UriLauncher::new(&url).launch(
+                    Some(&window_for_lore),
+                    gio::Cancellable::NONE,
+                    |_| {},
+                );
+            }
+        }
     });
 
     // ── Unfollow (right-click on a followed sidebar row) ──────────
@@ -1564,9 +1592,12 @@ pub(crate) struct PreviewLabels {
     pub cc_label: Label,
     pub subject_label: Label,
     pub date_label: Label,
+    pub message_id_label: Label,
     pub body_buffer: sv::Buffer,
     /// Reveals the full From/To/Cc when they are truncated.
     pub expand_toggle: ToggleButton,
+    /// Opens the selected message on lore.kernel.org; wired in `build_window`.
+    pub lore_btn: gtk4::Button,
 }
 
 /// Build the centre pane, returning the root widget, the selection model
@@ -1618,6 +1649,12 @@ fn build_center_pane(
     subject_label.set_xalign(0.0);
     let date_label = Label::new(Some(""));
     date_label.set_xalign(0.0);
+    // Message-ID is shown bare (no angle brackets) so it pastes straight into
+    // b4; selectable for manual copy, with a copy button alongside.
+    let message_id_label = Label::new(Some(""));
+    message_id_label.set_xalign(0.0);
+    message_id_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    message_id_label.set_selectable(true);
     let body_buffer = sv::Buffer::new(None::<&gtk4::TextTagTable>);
     body_buffer.set_highlight_syntax(true);
     // Sync SourceView style scheme with the app theme
@@ -1642,14 +1679,21 @@ fn build_center_pane(
     expand_toggle.set_visible(false);
     expand_toggle.set_active(expand_headers);
 
+    let lore_btn = gtk4::Button::from_icon_name("lorebird-web-symbolic");
+    lore_btn.set_tooltip_text(Some("Open this message on lore.kernel.org"));
+    lore_btn.add_css_class("flat");
+    lore_btn.set_sensitive(false);
+
     let preview_labels = PreviewLabels {
         from_label,
         to_label,
         cc_label,
         subject_label,
         date_label,
+        message_id_label,
         body_buffer,
         expand_toggle,
+        lore_btn,
     };
 
     (
@@ -2032,9 +2076,27 @@ fn build_preview_pane(labels: &PreviewLabels) -> Box {
     add_row(&headers, 2, "Cc", &labels.cc_label);
     add_row(&headers, 3, "Subject", &labels.subject_label);
     add_row(&headers, 4, "Date", &labels.date_label);
+    add_row(&headers, 5, "Message-ID", &labels.message_id_label);
 
     // Right of the From/To/Cc rows it controls (col 2, spanning rows 0..3).
     headers.attach(&labels.expand_toggle, 2, 0, 1, 3);
+
+    // Message-ID actions beside its row: copy the bare id, or open on lore.
+    let mid_actions = Box::new(Orientation::Horizontal, 4);
+    mid_actions.set_valign(Align::Center);
+    let copy_mid = gtk4::Button::from_icon_name("edit-copy-symbolic");
+    copy_mid.set_tooltip_text(Some("Copy the Message-ID to the clipboard"));
+    copy_mid.add_css_class("flat");
+    let mid_label = labels.message_id_label.clone();
+    copy_mid.connect_clicked(move |b| {
+        let mid = mid_label.label();
+        if !mid.is_empty() {
+            b.clipboard().set_text(&mid);
+        }
+    });
+    mid_actions.append(&copy_mid);
+    mid_actions.append(&labels.lore_btn);
+    headers.attach(&mid_actions, 2, 5, 1, 1);
 
     vbox.append(&headers);
 
