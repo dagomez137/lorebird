@@ -1632,6 +1632,13 @@ fn build_center_pane(
     let scrolled = ScrolledWindow::new();
     scrolled.set_vexpand(true);
     scrolled.set_hexpand(true);
+    // Automatic hscroll (never NEVER) keeps the ColumnView's content-driven
+    // minimum from propagating up: a deep thread's fixed TreeExpander indent
+    // or a long subject scrolls inside the list instead of raising the center
+    // pane's minimum and shoving the divider into the reading pane. Not
+    // propagating the natural width keeps the list at its allocated width.
+    scrolled.set_policy(PolicyType::Automatic, PolicyType::Automatic);
+    scrolled.set_propagate_natural_width(false);
     scrolled.set_child(Some(&column_view));
     vbox.append(&scrolled);
 
@@ -1647,6 +1654,10 @@ fn build_center_pane(
     cc_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
     let subject_label = Label::new(Some(""));
     subject_label.set_xalign(0.0);
+    // Wrap with a character fallback so the whole subject shows yet its width
+    // cannot raise the reading pane's minimum and move the divider on switch.
+    subject_label.set_wrap(true);
+    subject_label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
     let date_label = Label::new(Some(""));
     date_label.set_xalign(0.0);
     // Message-ID is shown bare (no angle brackets) so it pastes straight into
