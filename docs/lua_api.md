@@ -218,6 +218,55 @@ end
 
 ---
 
+### `lorefetch_all(maildir, queries) → result_table`
+
+Fetch a whole batch of queries into one maildir. The loop runs in Rust, so
+Lorebird knows the batch size up front and drives a determinate progress bar
+(step `k` of `N`, with a per-query label) as it works. Prefer this over a
+hand-rolled Lua `for` loop around `lorefetch()`: a manual loop leaves the
+batch size opaque, so the fetch phase can only pulse instead of showing
+`k/N`.
+
+Per-query failures are counted and the loop continues, matching the common
+"index whatever arrived, even if one list failed" intent. `queries` must be a
+sequence of strings; a non-sequence argument or a non-string element raises an
+error rather than silently fetching nothing.
+
+**Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `maildir` | string | Path to the local maildir directory |
+| `queries` | table | A sequence (array) of Xapian query strings |
+
+**Return value:**
+
+```lua
+{
+  ok       = true,   -- true when new > 0
+  new      = 12,     -- previously unknown messages across the whole batch
+  failures = 1,      -- number of queries that errored (loop still continued)
+}
+```
+
+**Example:**
+
+```lua
+local queries = {
+  "l:linux-modules.vger.kernel.org AND rt:6.months.ago..",
+  "l:linux-block.vger.kernel.org AND rt:6.weeks.ago..",
+}
+
+on_fetch = function(profile, maildir)
+  local r = lorefetch_all(maildir, queries)
+  print(string.format("[%s] %d new total, %d query failure(s)",
+                      profile, r.new or 0, r.failures or 0))
+  return (r.new or 0) > 0
+end
+```
+
+---
+
 ### `send_smtp(rfc2822_text) → result_table`
 
 Send an RFC 2822-formatted email via the current profile's SMTP configuration.

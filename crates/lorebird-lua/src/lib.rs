@@ -14,6 +14,7 @@ pub use config::{
 pub use lorebird_core::compose::Mail;
 pub use lorebird_sendmail::{SendError, SmtpConfig};
 
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,6 +24,75 @@ use mlua::{Lua, LuaSerdeExt, Result as LuaResult, Table, Value};
 
 /// Temp-file counter for unique filenames.
 static TMPFILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+// ── Fetch progress sink ─────────────────────────────────────────────
+//
+// A fetch hook (`on_fetch`) loops in Lua over N query strings, calling the
+// `lorefetch` / `lorefetch_all` builtins. Those builtins run on the Lua
+// thread (the VM is single-threaded) so we route per-query progress through
+// a thread-local sink installed for the duration of one fetch. The GTK Lua
+// thread installs a sink that forwards each event as a channel message.
+
+/// One progress event emitted by a fetch builtin.
+pub enum FetchProgress {
+    /// A single query in a fetch batch is about to run. `total` is `Some(n)`
+    /// when the batch size is known (`lorefetch_all`) and `None` for the bare
+    /// `lorefetch` path, where only a running step counter is available.
+    Query {
+        step: usize,
+        total: Option<usize>,
+        label: String,
+    },
+}
+
+/// A callback that consumes one fetch progress event.
+type ProgressSink = Box<dyn Fn(FetchProgress)>;
+
+thread_local! {
+    static PROGRESS_SINK: RefCell<Option<ProgressSink>> = const { RefCell::new(None) };
+    /// Running step counter for the bare `lorefetch` path, reset on install.
+    static PROGRESS_STEP: Cell<usize> = const { Cell::new(0) };
+}
+
+/// RAII guard that clears the installed progress sink when dropped.
+pub struct ProgressGuard {
+    _priv: (),
+}
+
+impl Drop for ProgressGuard {
+    fn drop(&mut self) {
+        PROGRESS_SINK.with(|s| *s.borrow_mut() = None);
+        PROGRESS_STEP.with(|c| c.set(0));
+    }
+}
+
+/// Install a progress sink for the current thread and reset the step counter.
+/// The returned guard clears the sink on drop, so callers should scope it to
+/// a single fetch. Only one sink may be installed at a time; installing a new
+/// one replaces the old.
+pub fn install_progress_sink(f: ProgressSink) -> ProgressGuard {
+    PROGRESS_SINK.with(|s| *s.borrow_mut() = Some(f));
+    PROGRESS_STEP.with(|c| c.set(0));
+    ProgressGuard { _priv: () }
+}
+
+/// Emit a progress event to the installed sink, if any. No-op otherwise.
+pub fn emit_progress(ev: FetchProgress) {
+    PROGRESS_SINK.with(|s| {
+        if let Some(sink) = s.borrow().as_ref() {
+            sink(ev);
+        }
+    });
+}
+
+/// Increment and return the per-install step counter (1-based).
+fn next_progress_step() -> usize {
+    PROGRESS_STEP.with(|c| {
+        let n = c.get() + 1;
+        c.set(n);
+        n
+    })
+}
 
 /// A Lua VM configured with the lorebird API.
 pub struct Vm {
@@ -214,6 +284,15 @@ impl Vm {
         let lorefetch_fn =
             self.lua
                 .create_function(|lua, (maildir, query): (String, String)| {
+                    // Bare-lorefetch path: the batch size is unknown to Rust,
+                    // so we emit a running step counter with `total: None`.
+                    let step = next_progress_step();
+                    emit_progress(FetchProgress::Query {
+                        step,
+                        total: None,
+                        label: query.clone(),
+                    });
+
                     let result = lorebird_lorefetch::fetch_to_maildir(
                         &query,
                         None, // search /all/ by default
@@ -240,6 +319,46 @@ impl Vm {
                 })?;
 
         self.lua.globals().set("lorefetch", lorefetch_fn)?;
+
+        // ── lorefetch_all(maildir, queries) → { ok, new, failures } ──
+        //   Fetch a batch of queries into a maildir. Rust knows the batch
+        //   size N up front, so it emits determinate `k/N` progress and a
+        //   per-query label. Per-query failures are accumulated and the loop
+        //   continues (matching the hand-rolled fetch_all semantics), so any
+        //   arrived mail is still indexed. Returns truthy `ok` when new > 0.
+        let lorefetch_all_fn =
+            self.lua
+                .create_function(|lua, (maildir, queries): (String, Value)| {
+                    let queries = read_query_list(&queries)?;
+                    let total = queries.len();
+                    let mut new_total: usize = 0;
+                    let mut failures: usize = 0;
+
+                    for (i, query) in queries.iter().enumerate() {
+                        emit_progress(FetchProgress::Query {
+                            step: i + 1,
+                            total: Some(total),
+                            label: query.clone(),
+                        });
+                        match lorebird_lorefetch::fetch_to_maildir(
+                            query,
+                            None,
+                            std::path::Path::new(&maildir),
+                            false,
+                        ) {
+                            Ok(r) => new_total += r.new_messages,
+                            Err(_) => failures += 1,
+                        }
+                    }
+
+                    let table = lua.create_table()?;
+                    table.set("ok", new_total > 0)?;
+                    table.set("new", new_total)?;
+                    table.set("failures", failures)?;
+                    Ok(table)
+                })?;
+
+        self.lua.globals().set("lorefetch_all", lorefetch_all_fn)?;
 
         // ── send_smtp(rfc2822_text) → { ok, error? } ────────────────
         //   Send an RFC 2822 message via the profile's SMTP config.
@@ -558,6 +677,30 @@ impl Drop for Vm {
     fn drop(&mut self) {
         self.cleanup_temp_files();
     }
+}
+
+/// Read a Lua sequence of strings into a `Vec<String>`, failing loudly on a
+/// non-sequence argument or a non-string element so a malformed `queries`
+/// table cannot silently fetch nothing.
+fn read_query_list(value: &Value) -> LuaResult<Vec<String>> {
+    let table = value.as_table().ok_or_else(|| {
+        mlua::Error::external("lorefetch_all: `queries` must be a sequence of strings")
+    })?;
+    // Read each element as a raw Value and require an actual Lua string. Reading
+    // directly as String would let Lua coerce a number (42 → "42"), silently
+    // accepting a malformed batch; we reject anything that is not a string.
+    let mut out = Vec::with_capacity(table.raw_len());
+    for entry in table.clone().sequence_values::<Value>() {
+        match entry? {
+            Value::String(s) => out.push(s.to_str()?.to_string()),
+            _ => {
+                return Err(mlua::Error::external(
+                    "lorefetch_all: every entry in `queries` must be a string",
+                ));
+            }
+        }
+    }
+    Ok(out)
 }
 
 // ── Lua ↔ Rust conversion helpers ─────────────────────────────────────
@@ -1058,6 +1201,96 @@ config = {
         let hooks = &loaded.profile_hooks["fail"];
         let result = vm.call_on_fetch("fail", "/tmp/none", hooks).unwrap();
         assert!(!result);
+    }
+
+    #[test]
+    fn lorefetch_all_rejects_non_sequence() {
+        let vm = Vm::new().unwrap();
+        // A string where a sequence is expected must error, not fetch nothing.
+        let err = vm
+            .lua
+            .load(r#"return lorefetch_all("/tmp/none", "not a table")"#)
+            .eval::<Table>()
+            .unwrap_err();
+        assert!(err.to_string().contains("sequence of strings"));
+    }
+
+    #[test]
+    fn lorefetch_all_rejects_non_string_entry() {
+        let vm = Vm::new().unwrap();
+        let err = vm
+            .lua
+            .load(r#"return lorefetch_all("/tmp/none", {"ok", 42})"#)
+            .eval::<Table>()
+            .unwrap_err();
+        assert!(err.to_string().contains("must be a string"));
+    }
+
+    #[test]
+    fn lorefetch_all_empty_batch_returns_falsy() {
+        let vm = Vm::new().unwrap();
+        // No queries → no network, no new mail, ok = false.
+        let result: Table = vm
+            .lua
+            .load(r#"return lorefetch_all("/tmp/none", {})"#)
+            .eval()
+            .unwrap();
+        assert_eq!(result.get::<bool>("ok").unwrap(), false);
+        assert_eq!(result.get::<i64>("new").unwrap(), 0);
+        assert_eq!(result.get::<i64>("failures").unwrap(), 0);
+    }
+
+    #[test]
+    fn progress_sink_receives_bare_lorefetch_steps() {
+        use std::sync::{Arc, Mutex};
+        let vm = Vm::new().unwrap();
+        let events: Arc<Mutex<Vec<(usize, Option<usize>)>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_events = events.clone();
+        let _guard = install_progress_sink(Box::new(move |ev| {
+            let FetchProgress::Query { step, total, .. } = ev;
+            sink_events.lock().unwrap().push((step, total));
+        }));
+
+        // Two bare lorefetch calls into a nonexistent maildir; the fetch itself
+        // fails but progress is emitted before the network attempt.
+        let _: Table = vm
+            .lua
+            .load(r#"return lorefetch("/nonexistent/xyz", "rt:1w..")"#)
+            .eval()
+            .unwrap();
+        let _: Table = vm
+            .lua
+            .load(r#"return lorefetch("/nonexistent/xyz", "rt:2w..")"#)
+            .eval()
+            .unwrap();
+
+        let got = events.lock().unwrap().clone();
+        assert_eq!(got, vec![(1, None), (2, None)]);
+    }
+
+    #[test]
+    fn progress_guard_clears_sink_on_drop() {
+        use std::sync::{Arc, Mutex};
+        let vm = Vm::new().unwrap();
+        let events: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let sink_events = events.clone();
+        {
+            let _guard = install_progress_sink(Box::new(move |_ev| {
+                *sink_events.lock().unwrap() += 1;
+            }));
+            let _: Table = vm
+                .lua
+                .load(r#"return lorefetch("/nonexistent/xyz", "rt:1w..")"#)
+                .eval()
+                .unwrap();
+        }
+        // Guard dropped: no sink, so this emits nowhere.
+        let _: Table = vm
+            .lua
+            .load(r#"return lorefetch("/nonexistent/xyz", "rt:2w..")"#)
+            .eval()
+            .unwrap();
+        assert_eq!(*events.lock().unwrap(), 1);
     }
 
     #[test]
