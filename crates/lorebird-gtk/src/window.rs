@@ -110,19 +110,28 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     reply_btn.set_sensitive(false); // greyed out until a message is selected
 
     // ── Progress bar (unified progress affordance) ─────────────
-    // Drives Refresh (determinate k/N fetch + index) and every quick query
-    // (search, view switch, All Mail) as an indeterminate pulse. Hidden when
-    // idle. `progress_indeterminate` tells the query poller to pulse it on
-    // each tick while a non-determinate operation is in flight.
+    // Lives in the bottom status row (see below). Drives Refresh (determinate
+    // k/N fetch + index) and every quick query (search, view switch, All Mail)
+    // as an indeterminate pulse. Hidden when idle. It carries only the fraction
+    // (shown as a percentage); the descriptive text lives in `status_label`, so
+    // the bar keeps a fixed width and never reflows as the query text changes.
+    // `progress_indeterminate` tells the query poller to pulse it on each tick
+    // while a non-determinate operation is in flight.
     let progress = ProgressBar::new();
     progress.set_show_text(true);
     progress.set_visible(false);
     progress.set_valign(Align::Center);
+    progress.set_size_request(STATUS_PROGRESS_WIDTH, -1);
     let progress_indeterminate = Rc::new(Cell::new(false));
 
     // ── Status bar (created early so callbacks can clone it) ──
+    // Fixed-width, ellipsizing column so a long query label truncates in place
+    // instead of resizing the row.
     let status_label = Label::new(Some("Ready \u{2014} select a profile, then Refresh"));
-    status_label.set_margin_start(8);
+    status_label.set_xalign(0.0);
+    status_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    status_label.set_width_chars(STATUS_TEXT_CHARS);
+    status_label.set_max_width_chars(STATUS_TEXT_CHARS);
     status_label.set_margin_top(4);
     status_label.set_margin_bottom(4);
     status_label.add_css_class("dim-label");
@@ -130,7 +139,6 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
 
     header.pack_end(&refresh_btn);
     header.pack_end(&reply_btn);
-    header.pack_end(&progress);
     window.set_titlebar(Some(&header));
 
     // ── Main vertical box: paned + status ──────────────────────
@@ -224,7 +232,15 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     outer_paned.set_hexpand(true);
 
     main_vbox.append(&outer_paned);
-    main_vbox.append(&status_label);
+    // Bottom status row: a fixed-width text column and a fixed-width progress
+    // bar, clustered at the right edge so both keep a constant size and place.
+    let status_row = Box::new(Orientation::Horizontal, 12);
+    status_row.set_halign(Align::End);
+    status_row.set_margin_start(8);
+    status_row.set_margin_end(8);
+    status_row.append(&status_label);
+    status_row.append(&progress);
+    main_vbox.append(&status_row);
     window.set_child(Some(&main_vbox));
 
     // ── Track the currently selected node ────────────
@@ -292,18 +308,25 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
                             return glib::ControlFlow::Continue;
                         };
                         if let LuaResult::FetchProgress { phase, step, total, label, .. } = &result {
+                            let display = crate::app_state::describe_fetch_progress(
+                                *phase, *step, *total, label,
+                            );
                             match crate::app_state::fetch_progress_fraction(*phase, *step, *total) {
                                 Some(f) => {
                                     indeterminate_poll.set(false);
                                     progress_poll.set_fraction(f);
+                                    // Text None lets the bar show its percentage.
+                                    progress_poll.set_text(None);
                                 }
                                 None => {
                                     indeterminate_poll.set(true);
                                     progress_poll.pulse();
+                                    // Blank the bar text: a percentage is
+                                    // meaningless while pulsing.
+                                    progress_poll.set_text(Some(""));
                                 }
                             }
-                            progress_poll.set_text(Some(label));
-                            status_poll.set_text(label);
+                            status_poll.set_text(&display);
                             continue;
                         }
 
@@ -316,7 +339,7 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
                                 // the bar (0.9 → 1.0) and hides it on done.
                                 indeterminate_poll.set(false);
                                 progress_poll.set_fraction(0.9);
-                                progress_poll.set_text(Some("Rebuilding view\u{2026}"));
+                                progress_poll.set_text(None);
                                 status_poll.set_text("Rebuilding view\u{2026}");
                             }
                             Err(e) => {
@@ -1500,7 +1523,8 @@ fn progress_pulse_start(progress: &ProgressBar, indeterminate: &Rc<Cell<bool>>) 
     indeterminate.set(true);
     progress.set_visible(true);
     progress.set_fraction(0.0);
-    progress.set_text(None);
+    // Blank text: a percentage is meaningless while pulsing.
+    progress.set_text(Some(""));
     progress.pulse();
 }
 
@@ -2278,6 +2302,12 @@ const READING_PANE_MIN_COLUMNS: i32 = 60;
 const THREAD_LIST_MIN_WIDTH: i32 = 320;
 /// Default width of the thread list when the window first opens, in pixels.
 const THREAD_LIST_DEFAULT_WIDTH: i32 = 520;
+
+/// Fixed width of the bottom status text, in characters. The label ellipsizes
+/// so a long query description truncates in place instead of resizing the row.
+const STATUS_TEXT_CHARS: i32 = 48;
+/// Fixed width of the bottom progress bar, in pixels, so it never reflows.
+const STATUS_PROGRESS_WIDTH: i32 = 200;
 
 /// Pixel width that fits `columns` monospace characters in the reading pane,
 /// with an allowance for the body's line-number gutter, margins and scrollbar.

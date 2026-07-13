@@ -544,6 +544,62 @@ pub fn fetch_progress_fraction(
     }
 }
 
+/// Build the status-bar text for one fetch progress event: a short
+/// description of the work plus the step counter. The index phase already
+/// carries a friendly label; only the fetch phase gets a query description.
+pub fn describe_fetch_progress(
+    phase: crate::lua_thread::FetchPhase,
+    step: usize,
+    total: Option<usize>,
+    label: &str,
+) -> String {
+    use crate::lua_thread::FetchPhase;
+    match phase {
+        FetchPhase::Fetch => {
+            let what = describe_query(label);
+            match total {
+                Some(n) => format!("{what} ({step}/{n})\u{2026}"),
+                None => format!("{what} (step {step})\u{2026}"),
+            }
+        }
+        FetchPhase::Index => label.to_string(),
+    }
+}
+
+/// Turn a fetch query into a short human description for the status bar.
+///
+/// Classifies by the leading field prefix: `l:` yields the list name, and the
+/// author (`f:`) and correspondence (`a:`) feeds get a generic label. Anything
+/// unrecognised falls back to a truncated echo of the raw query so the text
+/// stays bounded even without a description.
+pub fn describe_query(query: &str) -> String {
+    let q = query.trim().trim_start_matches('(').trim_start();
+    let lower = q.to_ascii_lowercase();
+
+    if let Some(rest) = lower.strip_prefix("l:").or_else(|| lower.strip_prefix("list:")) {
+        let list = rest.split_whitespace().next().unwrap_or("");
+        let short = list.split('.').next().unwrap_or(list);
+        if !short.is_empty() {
+            return format!("Fetching {short}");
+        }
+    }
+    if lower.starts_with("f:") || lower.starts_with("from:") {
+        return "Fetching author mail".to_string();
+    }
+    if lower.starts_with("a:") || lower.starts_with("addr:") {
+        return "Fetching correspondence".to_string();
+    }
+
+    const MAX: usize = 40;
+    if q.chars().count() > MAX {
+        let mut s: String = q.chars().take(MAX).collect();
+        s.push('\u{2026}');
+        s
+    } else {
+        q.to_string()
+    }
+}
+
 pub(crate) fn format_relative_time(ts: i64) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -560,4 +616,31 @@ pub(crate) fn format_relative_time(ts: i64) -> String {
     else if hours > 0 { format!("{}h ago", hours) }
     else if mins > 0 { format!("{}m ago", mins) }
     else { "just now".to_string() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::describe_query;
+
+    #[test]
+    fn describe_query_names_the_list() {
+        assert_eq!(
+            describe_query("l:linux-modules.vger.kernel.org AND rt:6.months.ago.."),
+            "Fetching linux-modules"
+        );
+    }
+
+    #[test]
+    fn describe_query_generic_author_and_addr() {
+        assert_eq!(describe_query("f:(hch@lst.de OR hch@sgi.com)"), "Fetching author mail");
+        assert_eq!(describe_query("a:(da.gomez@kernel.org)"), "Fetching correspondence");
+    }
+
+    #[test]
+    fn describe_query_truncates_unrecognised() {
+        let long = "s:some very long subject phrase that keeps going well past the limit";
+        let got = describe_query(long);
+        assert!(got.chars().count() <= 41, "truncated to about 40 chars plus ellipsis");
+        assert!(got.ends_with('\u{2026}'));
+    }
 }
