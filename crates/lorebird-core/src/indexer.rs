@@ -57,11 +57,29 @@ fn collect_mail_files(dir: &Path) -> Vec<std::path::PathBuf> {
 ///
 /// Returns the number of newly inserted messages.
 pub fn index_maildir(conn: &Connection, maildir_path: &Path) -> SqlResult<usize> {
+    index_maildir_with_progress(conn, maildir_path, &mut |_, _| {})
+}
+
+/// Like [`index_maildir`], but reports progress as it inserts.
+///
+/// `progress(inserted_so_far, candidate_total)` is called with a coarse count
+/// throttled to every few hundred inserts plus once at the end.
+/// `candidate_total` is the number of files that survive the already-indexed
+/// pre-filter, so it is the count of messages that will actually be parsed and
+/// inserted this run. The callback is invoked between SQLite statements, never
+/// while a `Statement` borrow is live, and observes the loop counter (not a
+/// committed row count): the single transaction is a durability boundary, not
+/// a visibility one for our own connection.
+pub fn index_maildir_with_progress(
+    conn: &Connection,
+    maildir_path: &Path,
+    progress: &mut dyn FnMut(usize, usize),
+) -> SqlResult<usize> {
     schema::init_db(conn)?;
 
     // Wrap all inserts in a single transaction — avoids per-row fsync.
     conn.execute_batch("BEGIN")?;
-    let result = index_maildir_inner(conn, maildir_path);
+    let result = index_maildir_inner(conn, maildir_path, progress);
     match &result {
         Ok(_) => conn.execute_batch("COMMIT")?,
         Err(_) => { let _ = conn.execute_batch("ROLLBACK"); }
@@ -69,7 +87,15 @@ pub fn index_maildir(conn: &Connection, maildir_path: &Path) -> SqlResult<usize>
     result
 }
 
-fn index_maildir_inner(conn: &Connection, maildir_path: &Path) -> SqlResult<usize> {
+/// Report progress at most every this many inserts (plus once at the end),
+/// so a huge maildir does not flood the progress channel.
+const PROGRESS_THROTTLE: usize = 256;
+
+fn index_maildir_inner(
+    conn: &Connection,
+    maildir_path: &Path,
+    progress: &mut dyn FnMut(usize, usize),
+) -> SqlResult<usize> {
 
     let mut inserted = 0usize;
 
@@ -94,6 +120,11 @@ fn index_maildir_inner(conn: &Connection, maildir_path: &Path) -> SqlResult<usiz
         }
     }
 
+    // Collect the candidate files (those surviving the already-indexed
+    // pre-filter) up front so we know the denominator for progress before the
+    // parse+insert loop. This walks the two maildir subdirs once; the pre-
+    // filter is a cheap in-memory set membership test.
+    let mut candidates: Vec<(std::path::PathBuf, String)> = Vec::new();
     for subdir in &["cur", "new"] {
         let dir = maildir_path.join(subdir);
         if !dir.is_dir() {
@@ -119,8 +150,16 @@ fn index_maildir_inner(conn: &Connection, maildir_path: &Path) -> SqlResult<usiz
             if indexed.contains(&rel_path) {
                 continue;
             }
+            candidates.push((file_path, rel_path));
+        }
+    }
 
-            let raw = match std::fs::read(&file_path) {
+    let candidate_total = candidates.len();
+    progress(0, candidate_total);
+
+    {
+        for (file_path, rel_path) in &candidates {
+            let raw = match std::fs::read(file_path) {
                 Ok(b) => b,
                 Err(_) => continue,
             };
@@ -199,9 +238,13 @@ fn index_maildir_inner(conn: &Connection, maildir_path: &Path) -> SqlResult<usiz
             )?;
 
             inserted += 1;
+            if inserted.is_multiple_of(PROGRESS_THROTTLE) {
+                progress(inserted, candidate_total);
+            }
         }
     }
 
+    progress(inserted, candidate_total);
     Ok(inserted)
 }
 
@@ -260,6 +303,42 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM mail_fts", [], |r| r.get(0))
             .unwrap();
         assert_eq!(fts_count, 3);
+    }
+
+    #[test]
+    fn progress_callback_is_monotonic_and_final_matches_count() {
+        let conn = Connection::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        for sub in &["cur", "new", "tmp"] {
+            std::fs::create_dir_all(tmp.path().join(sub)).unwrap();
+        }
+
+        for i in 0..5 {
+            write_msg(
+                tmp.path(),
+                &format!("170000000{i}.aaa.host"),
+                "S",
+                &format!("m{i}@x"),
+            );
+        }
+
+        let mut observed: Vec<(usize, usize)> = Vec::new();
+        let n = index_maildir_with_progress(&conn, tmp.path(), &mut |done, total| {
+            observed.push((done, total));
+        })
+        .unwrap();
+
+        assert_eq!(n, 5);
+        // At least the initial (0, total) and the final (n, total) calls fire.
+        assert!(observed.len() >= 2);
+        let total = observed[0].1;
+        assert_eq!(total, 5, "candidate total is the post-pre-filter count");
+        // `done` never decreases and `total` is constant across the run.
+        for w in observed.windows(2) {
+            assert!(w[0].0 <= w[1].0, "done must be monotonically non-decreasing");
+            assert_eq!(w[0].1, w[1].1, "total must be constant");
+        }
+        assert_eq!(observed.last().unwrap().0, n, "final done equals returned count");
     }
 
     /// A flag change on an already-indexed file (same stable basename, new
