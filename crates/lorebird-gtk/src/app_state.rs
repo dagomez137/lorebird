@@ -456,7 +456,11 @@ impl AppState {
                 // Init results are handled synchronously in AppState::new()
                 Err("unexpected init result in fetch handler".to_string())
             }
-            LuaResult::ReplyDone { .. } | LuaResult::SendDone { .. } => {
+            LuaResult::FetchProgress { .. }
+            | LuaResult::ReplyDone { .. }
+            | LuaResult::SendDone { .. } => {
+                // FetchProgress is non-terminal and drained by the poller; it
+                // must never reach the terminal handler.
                 Err("unexpected result in fetch handler".to_string())
             }
         }
@@ -514,6 +518,29 @@ fn format_status(desc: Option<&PendingDesc>, match_count: Option<usize>) -> Stri
             }
         }
         None => "Done".to_string(),
+    }
+}
+
+/// Map a fetch progress event to a progress-bar fraction and text.
+///
+/// The bar is partitioned into three weighted segments: fetch [0.0, 0.7],
+/// index [0.7, 0.9], and the query-worker rebuild [0.9, 1.0] (driven
+/// separately by the query poller). Within a segment the fraction is `None`
+/// when the denominator is unknown (bare `lorefetch`), signalling the caller
+/// to pulse the bar instead.
+pub fn fetch_progress_fraction(
+    phase: crate::lua_thread::FetchPhase,
+    step: usize,
+    total: Option<usize>,
+) -> Option<f64> {
+    use crate::lua_thread::FetchPhase;
+    match phase {
+        FetchPhase::Fetch => total.and_then(|n| {
+            (n > 0).then(|| 0.7 * (step.min(n) as f64) / n as f64)
+        }),
+        FetchPhase::Index => total.and_then(|n| {
+            (n > 0).then(|| 0.7 + 0.2 * (step.min(n) as f64) / n as f64)
+        }),
     }
 }
 

@@ -43,6 +43,16 @@ pub enum LuaCommand {
     Shutdown,
 }
 
+/// Which phase of a fetch a progress event belongs to. Both are non-terminal;
+/// `FetchDone` remains the sole terminal result of a fetch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchPhase {
+    /// Running the `on_fetch` hook (network fetch, per query).
+    Fetch,
+    /// Indexing the freshly-fetched maildir into SQLite.
+    Index,
+}
+
 /// Results sent from the Lua thread back to the main thread.
 #[derive(Debug)]
 pub enum LuaResult {
@@ -63,6 +73,20 @@ pub enum LuaResult {
     /// Config loading failed.
     InitFailed {
         error: String,
+    },
+
+    /// Non-terminal progress update during a fetch. Emitted per fetch query
+    /// and per indexing batch; the poller drains these to drive the progress
+    /// bar and breaks only on the terminal `FetchDone`.
+    FetchProgress {
+        // The active profile is implicit in the single in-flight fetch; the
+        // field is carried for symmetry with FetchDone and future routing.
+        #[allow(dead_code)]
+        profile_label: String,
+        phase: FetchPhase,
+        step: usize,
+        total: Option<usize>,
+        label: String,
     },
 
     /// Fetch + index operation completed.
@@ -207,7 +231,7 @@ fn lua_thread_main(
                     maildir.display()
                 );
                 let t = std::time::Instant::now();
-                let result = handle_fetch(&state, &profile_label, &maildir);
+                let result = handle_fetch(&state, &profile_label, &maildir, &result_tx);
                 eprintln!("[lorebird-lua] Fetch complete in {:?}", t.elapsed());
                 let _ = result_tx.send(result);
             }
@@ -261,17 +285,38 @@ fn load_config(
 }
 
 /// Handle a Fetch command: call on_fetch, then index if truthy.
+///
+/// `result_tx` is cloned into a progress sink so per-query fetch progress and
+/// per-batch index progress reach the UI as non-terminal `FetchProgress`
+/// results ahead of the terminal `FetchDone` this returns.
 fn handle_fetch(
     state: &LuaState,
     profile_label: &str,
     maildir: &std::path::Path,
+    result_tx: &mpsc::Sender<LuaResult>,
 ) -> LuaResult {
     // 1. Look up the profile hooks
     let hooks = state.config.profile_hooks.get(profile_label);
 
-    // 2. Call on_fetch hook (if defined)
+    // 2. Call on_fetch hook (if defined), with a progress sink installed for
+    //    its duration. The sink forwards each per-query event as a channel
+    //    message; the RAII guard clears it before we return.
     if let Some(hooks) = hooks {
         eprintln!("[lorebird-lua]   calling on_fetch for '{}'...", profile_label);
+        let _guard = lorebird_lua::install_progress_sink(Box::new({
+            let tx = result_tx.clone();
+            let pl = profile_label.to_string();
+            move |ev| {
+                let lorebird_lua::FetchProgress::Query { step, total, label } = ev;
+                let _ = tx.send(LuaResult::FetchProgress {
+                    profile_label: pl.clone(),
+                    phase: FetchPhase::Fetch,
+                    step,
+                    total,
+                    label,
+                });
+            }
+        }));
         match state.vm.call_on_fetch(profile_label, maildir.to_str().unwrap_or(""), hooks) {
             Ok(true) => {
                 eprintln!("[lorebird-lua]   on_fetch returned true — indexing");
@@ -325,7 +370,20 @@ fn handle_fetch(
     // Enable WAL for concurrent readers
     let _ = conn.execute_batch("PRAGMA journal_mode=WAL;");
 
-    match lorebird_core::indexer::index_maildir(&conn, maildir) {
+    let index_result = {
+        let pl = profile_label.to_string();
+        let tx = result_tx.clone();
+        lorebird_core::indexer::index_maildir_with_progress(&conn, maildir, &mut |done, total| {
+            let _ = tx.send(LuaResult::FetchProgress {
+                profile_label: pl.clone(),
+                phase: FetchPhase::Index,
+                step: done,
+                total: Some(total),
+                label: format!("Indexing {} messages\u{2026}", total),
+            });
+        })
+    };
+    match index_result {
         Ok(n) => {
             eprintln!("[lorebird-lua]   indexed {} message(s)", n);
             LuaResult::FetchDone {

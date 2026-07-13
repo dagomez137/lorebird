@@ -299,8 +299,12 @@ own SQLite connection and builds GObjects locally.
 - `on_fetch` hooks that call `lorefetch()` or `sh()` may take minutes.
   The Lua thread blocks during this, but the main thread stays
   responsive.
-- For progress reporting, the Lua thread could send intermediate
-  `LuaResult::FetchProgress { message }` variants through the same
-  channel, displayed in the status bar.
+- Progress reporting is implemented: during a fetch the Lua thread sends
+  non-terminal `LuaResult::FetchProgress { phase, step, total, label }`
+  variants through the same channel ahead of the terminal `FetchDone`. A
+  thread-local progress sink (installed for the duration of one fetch) lets
+  the `lorefetch`/`lorefetch_all` builtins emit per-query events, and the
+  indexer reports per-batch counts. The GTK poller drains these to drive a
+  determinate progress bar.
 - If we want cancel-on-close, the main thread can send `Shutdown` and
   the Lua thread will exit its receive loop.

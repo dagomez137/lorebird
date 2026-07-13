@@ -15,7 +15,7 @@ use gtk4::prelude::*;
 use gtk4::{
     Align, Application, ApplicationWindow, Box, CustomSorter, FlowBox, Grid, HeaderBar, IconSize,
     Image, Label, ListBoxRow, ListItem, ListView, Ordering, Orientation, Paned, PolicyType,
-    ScrolledWindow, SearchEntry, SignalListItemFactory, SingleSelection, SortListModel, Spinner,
+    ProgressBar, ScrolledWindow, SearchEntry, SignalListItemFactory, SingleSelection, SortListModel,
     ToggleButton, TreeExpander, TreeListModel, TreeListRow, WrapMode,
 };
 use lorebird_lua::ContactGroup;
@@ -25,7 +25,7 @@ use sourceview5::prelude::*;
 use crate::app_state::{AppState, PendingDesc};
 use crate::compose::{self, ComposeContext};
 use crate::folder_item::{FolderItem, FolderKind};
-use crate::lua_thread::LuaCommand;
+use crate::lua_thread::{LuaCommand, LuaResult};
 use crate::thread_node::ThreadNode;
 use lorebird_core::compose::Mail;
 use lorebird_core::follows::Follow;
@@ -109,9 +109,16 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     reply_btn.set_tooltip_text(Some("Reply (Ctrl+R)"));
     reply_btn.set_sensitive(false); // greyed out until a message is selected
 
-    // ── Spinner (shown during async fetch) ─────────────────────
-    let spinner = Spinner::new();
-    spinner.set_spinning(false);
+    // ── Progress bar (unified progress affordance) ─────────────
+    // Drives Refresh (determinate k/N fetch + index) and every quick query
+    // (search, view switch, All Mail) as an indeterminate pulse. Hidden when
+    // idle. `progress_indeterminate` tells the query poller to pulse it on
+    // each tick while a non-determinate operation is in flight.
+    let progress = ProgressBar::new();
+    progress.set_show_text(true);
+    progress.set_visible(false);
+    progress.set_valign(Align::Center);
+    let progress_indeterminate = Rc::new(Cell::new(false));
 
     // ── Status bar (created early so callbacks can clone it) ──
     let status_label = Label::new(Some("Ready \u{2014} select a profile, then Refresh"));
@@ -123,7 +130,7 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
 
     header.pack_end(&refresh_btn);
     header.pack_end(&reply_btn);
-    header.pack_end(&spinner);
+    header.pack_end(&progress);
     window.set_titlebar(Some(&header));
 
     // ── Main vertical box: paned + status ──────────────────────
@@ -249,45 +256,83 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     // ── Wire Refresh button (async via Lua thread) ───────────────
     let state_for_refresh = state.clone();
     let status_for_refresh = status_label.clone();
-    let spinner_for_refresh = spinner.clone();
+    let progress_for_refresh = progress.clone();
+    let indeterminate_for_refresh = progress_indeterminate.clone();
     let refresh_btn_ref = refresh_btn.clone();
     refresh_btn.connect_clicked(move |_btn| {
         refresh_btn_ref.set_sensitive(false);
         let s = state_for_refresh.borrow();
         match s.request_fetch() {
             Ok(()) => {
-                spinner_for_refresh.set_spinning(true);
+                // Determinate segments (fetch/index) own the bar; the poller
+                // pulses only while a segment reports an unknown total.
+                indeterminate_for_refresh.set(false);
+                progress_for_refresh.set_visible(true);
+                progress_for_refresh.set_fraction(0.0);
+                progress_for_refresh.set_text(Some("Refreshing\u{2026}"));
                 status_for_refresh.set_text("Refreshing\u{2026}");
                 let state_poll = state_for_refresh.clone();
                 let status_poll = status_for_refresh.clone();
-                let spinner_poll = spinner_for_refresh.clone();
+                let progress_poll = progress_for_refresh.clone();
+                let indeterminate_poll = indeterminate_for_refresh.clone();
                 let btn_poll = refresh_btn_ref.clone();
                 glib::timeout_add_local(Duration::from_millis(100), move || {
                     let s = state_poll.borrow();
-                    match s.poll_fetch_result() {
-                        Some(result) => {
-                            btn_poll.set_sensitive(true);
-                            match s.handle_fetch_result(&result) {
-                                Ok(()) => {
-                                    // The list rebuild was dispatched to the
-                                    // query worker; the persistent query poller
-                                    // stops the spinner and sets the final
-                                    // status (and scrolls to the top).
-                                    status_poll.set_text("Indexing\u{2026}");
+                    // Drain every available result this tick, updating the bar
+                    // for each non-terminal FetchProgress and breaking only on
+                    // the terminal FetchDone (or an error).
+                    loop {
+                        let Some(result) = s.poll_fetch_result() else {
+                            // Nothing terminal yet. If the current segment has
+                            // no known total we pulse; otherwise the last
+                            // fraction stands.
+                            if indeterminate_poll.get() {
+                                progress_poll.pulse();
+                            }
+                            return glib::ControlFlow::Continue;
+                        };
+                        if let LuaResult::FetchProgress { phase, step, total, label, .. } = &result {
+                            match crate::app_state::fetch_progress_fraction(*phase, *step, *total) {
+                                Some(f) => {
+                                    indeterminate_poll.set(false);
+                                    progress_poll.set_fraction(f);
                                 }
-                                Err(e) => {
-                                    spinner_poll.set_spinning(false);
-                                    status_poll.set_text(&format!("Refresh error: {}", e));
+                                None => {
+                                    indeterminate_poll.set(true);
+                                    progress_poll.pulse();
                                 }
                             }
-                            glib::ControlFlow::Break
+                            progress_poll.set_text(Some(label));
+                            status_poll.set_text(label);
+                            continue;
                         }
-                        None => glib::ControlFlow::Continue,
+
+                        // Terminal result: hand off to the query rebuild phase.
+                        btn_poll.set_sensitive(true);
+                        match s.handle_fetch_result(&result) {
+                            Ok(()) => {
+                                // The list rebuild was dispatched to the query
+                                // worker; the persistent query poller finishes
+                                // the bar (0.9 → 1.0) and hides it on done.
+                                indeterminate_poll.set(false);
+                                progress_poll.set_fraction(0.9);
+                                progress_poll.set_text(Some("Rebuilding view\u{2026}"));
+                                status_poll.set_text("Rebuilding view\u{2026}");
+                            }
+                            Err(e) => {
+                                indeterminate_poll.set(false);
+                                progress_poll.set_visible(false);
+                                progress_poll.set_text(None);
+                                status_poll.set_text(&format!("Refresh error: {}", e));
+                            }
+                        }
+                        return glib::ControlFlow::Break;
                     }
                 });
             }
             Err(e) => {
                 refresh_btn_ref.set_sensitive(true);
+                progress_for_refresh.set_visible(false);
                 status_for_refresh.set_text(&format!("Refresh error: {}", e));
             }
         }
@@ -297,15 +342,17 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     // The background query worker delivers `PlainNode` trees here in
     // batches (newest-first). This poller applies current batches, discards
     // stale ones, and updates the status bar. On the first batch it scrolls
-    // to the top so the newest mail is visible immediately; the spinner
-    // keeps running until the final batch arrives.
+    // to the top so the newest mail is visible immediately; the progress bar
+    // keeps pulsing (or holding its fetch fraction) until the final batch.
     let state_for_qpoll = state.clone();
     let status_for_qpoll = status_label.clone();
-    let spinner_for_qpoll = spinner.clone();
+    let progress_for_qpoll = progress.clone();
+    let indeterminate_for_qpoll = progress_indeterminate.clone();
     let column_view_for_qpoll = thread_view.clone();
     glib::timeout_add_local(Duration::from_millis(50), move || {
         let s = state_for_qpoll.borrow();
         let mut scroll_to_top = false;
+        let mut finished = false;
         while let Some(result) = s.poll_query_result() {
             if let Some(outcome) = s.apply_query_result(&result) {
                 status_for_qpoll.set_text(&outcome.status);
@@ -313,9 +360,28 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
                     scroll_to_top = true;
                 }
                 if outcome.done {
-                    spinner_for_qpoll.set_spinning(false);
+                    finished = true;
                 }
             }
+        }
+        if finished {
+            // Complete and hide the bar. This is the terminal step for both the
+            // post-fetch rebuild (bar arrives at 0.9) and any quick indeterminate
+            // query (search / view switch / All Mail). A short delay lets the
+            // full bar register before it disappears.
+            indeterminate_for_qpoll.set(false);
+            if progress_for_qpoll.is_visible() {
+                progress_for_qpoll.set_fraction(1.0);
+                let p = progress_for_qpoll.clone();
+                glib::timeout_add_local_once(Duration::from_millis(1200), move || {
+                    p.set_visible(false);
+                    p.set_text(None);
+                });
+            }
+        } else if indeterminate_for_qpoll.get() && progress_for_qpoll.is_visible() {
+            // A quick query is streaming with no natural step count: keep the
+            // bar pulsing until its final batch arrives.
+            progress_for_qpoll.pulse();
         }
         if scroll_to_top {
             let cv = column_view_for_qpoll.clone();
@@ -336,7 +402,8 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     let selected_node_sidebar = selected_node.clone();
     let reply_btn_sidebar = reply_btn.clone();
     let column_view_for_sidebar = thread_view.clone();
-    let spinner_for_sidebar = spinner.clone();
+    let progress_for_sidebar = progress.clone();
+    let indeterminate_for_sidebar = progress_indeterminate.clone();
     let model = sidebar_model;
     sidebar_lb.connect_row_selected(move |_lb, row| {
         let Some(row) = row else { return };
@@ -384,12 +451,12 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
                     }
                 }
                 if s.db.borrow().is_some() {
-                    spinner_for_sidebar.set_spinning(true);
+                    progress_pulse_start(&progress_for_sidebar, &indeterminate_for_sidebar);
                     status_for_sidebar.set_text("Loading\u{2026}");
                     if let Err(e) = s.request_load_all(PendingDesc::AllMail {
                         profile: profile.to_string(),
                     }) {
-                        spinner_for_sidebar.set_spinning(false);
+                        progress_hide(&progress_for_sidebar, &indeterminate_for_sidebar);
                         status_for_sidebar.set_text(&format!("Error: {}", e));
                     }
                 } else {
@@ -435,7 +502,7 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
                 // Run the (possibly augmented) query
                 s.select_view(effective.clone());
                 search_for_sidebar.set_text(&query);
-                spinner_for_sidebar.set_spinning(true);
+                progress_pulse_start(&progress_for_sidebar, &indeterminate_for_sidebar);
                 status_for_sidebar.set_text("Searching\u{2026}");
                 if let Err(e) = s.request_search(
                     effective,
@@ -444,7 +511,7 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
                         profile: profile.to_string(),
                     },
                 ) {
-                    spinner_for_sidebar.set_spinning(false);
+                    progress_hide(&progress_for_sidebar, &indeterminate_for_sidebar);
                     status_for_sidebar.set_text(&format!("Search error: {}", e));
                 }
             }
@@ -626,11 +693,12 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     // Enter / activate → run search query
     let state_for_search = state.clone();
     let status_for_search = status_label.clone();
-    let spinner_for_search = spinner.clone();
+    let progress_for_search = progress.clone();
+    let indeterminate_for_search = progress_indeterminate.clone();
     search_entry.connect_activate(move |entry| {
         let query = entry.text().to_string();
         let s = state_for_search.borrow();
-        spinner_for_search.set_spinning(true);
+        progress_pulse_start(&progress_for_search, &indeterminate_for_search);
         let dispatch = if query.is_empty() {
             status_for_search.set_text("Loading\u{2026}");
             s.request_load_all(PendingDesc::ShowAll)
@@ -639,7 +707,7 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
             s.request_search(query, PendingDesc::Search)
         };
         if let Err(e) = dispatch {
-            spinner_for_search.set_spinning(false);
+            progress_hide(&progress_for_search, &indeterminate_for_search);
             status_for_search.set_text(&format!("Search error: {}", e));
         }
     });
@@ -647,14 +715,15 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     // Escape / stop-search → clear search, show all
     let state_for_clear = state.clone();
     let status_for_clear = status_label.clone();
-    let spinner_for_clear = spinner.clone();
+    let progress_for_clear = progress.clone();
+    let indeterminate_for_clear = progress_indeterminate.clone();
     search_entry.connect_stop_search(move |entry| {
         entry.set_text("");
         let s = state_for_clear.borrow();
-        spinner_for_clear.set_spinning(true);
+        progress_pulse_start(&progress_for_clear, &indeterminate_for_clear);
         status_for_clear.set_text("Loading\u{2026}");
         if let Err(e) = s.request_load_all(PendingDesc::ShowAll) {
-            spinner_for_clear.set_spinning(false);
+            progress_hide(&progress_for_clear, &indeterminate_for_clear);
             status_for_clear.set_text(&format!("Error: {}", e));
         }
     });
@@ -755,7 +824,10 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     let window_for_follow = window.clone();
     let sbmodel_for_follow_btn = sidebar_model_for_follow.clone();
     let defprofile_for_follow = default_profile.clone();
-    let spinner_for_follow = spinner.clone();
+    let progress_ui_for_follow = ProgressUi {
+        bar: progress.clone(),
+        indeterminate: progress_indeterminate.clone(),
+    };
     let context_menu_for_follow = context_menu.clone();
     follow_menu_btn.connect_clicked(move |_btn| {
         context_menu_for_follow.popdown();
@@ -766,7 +838,7 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
                 &state_for_follow,
                 &sbmodel_for_follow_btn,
                 &defprofile_for_follow,
-                &spinner_for_follow,
+                &progress_ui_for_follow,
                 &status_for_follow,
                 &subject,
             ),
@@ -779,7 +851,8 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     let state_for_archive = state.clone();
     let selected_for_archive = selected_node.clone();
     let status_for_archive = status_label.clone();
-    let spinner_for_archive = spinner.clone();
+    let progress_for_archive = progress.clone();
+    let indeterminate_for_archive = progress_indeterminate.clone();
     let context_menu_for_archive = context_menu.clone();
     archive_menu_btn.connect_clicked(move |_btn| {
         context_menu_for_archive.popdown();
@@ -792,9 +865,9 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
         match s.archive_series(&subject) {
             Ok(n) => {
                 status_for_archive.set_text(&format!("Archived {} message(s)", n));
-                spinner_for_archive.set_spinning(true);
+                progress_pulse_start(&progress_for_archive, &indeterminate_for_archive);
                 if let Err(e) = s.rerun_active_view() {
-                    spinner_for_archive.set_spinning(false);
+                    progress_hide(&progress_for_archive, &indeterminate_for_archive);
                     status_for_archive.set_text(&format!("Archive refresh failed: {}", e));
                 }
             }
@@ -806,7 +879,8 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     let state_for_unarchive = state.clone();
     let selected_for_unarchive = selected_node.clone();
     let status_for_unarchive = status_label.clone();
-    let spinner_for_unarchive = spinner.clone();
+    let progress_for_unarchive = progress.clone();
+    let indeterminate_for_unarchive = progress_indeterminate.clone();
     let context_menu_for_unarchive = context_menu.clone();
     unarchive_menu_btn.connect_clicked(move |_btn| {
         context_menu_for_unarchive.popdown();
@@ -819,9 +893,9 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
         match s.unarchive_series(&subject) {
             Ok(n) => {
                 status_for_unarchive.set_text(&format!("Unarchived {} message(s)", n));
-                spinner_for_unarchive.set_spinning(true);
+                progress_pulse_start(&progress_for_unarchive, &indeterminate_for_unarchive);
                 if let Err(e) = s.rerun_active_view() {
-                    spinner_for_unarchive.set_spinning(false);
+                    progress_hide(&progress_for_unarchive, &indeterminate_for_unarchive);
                     status_for_unarchive.set_text(&format!("Unarchive refresh failed: {}", e));
                 }
             }
@@ -1419,6 +1493,42 @@ fn refresh_follow_rows(model: &ListStore, profile: &str, follows: &[Follow]) {
     }
 }
 
+/// Start the progress bar in indeterminate (pulsing) mode. The query poller
+/// advances the pulse on each tick while `indeterminate` is set, and hides the
+/// bar when the operation reports `done`.
+fn progress_pulse_start(progress: &ProgressBar, indeterminate: &Rc<Cell<bool>>) {
+    indeterminate.set(true);
+    progress.set_visible(true);
+    progress.set_fraction(0.0);
+    progress.set_text(None);
+    progress.pulse();
+}
+
+/// Hide the progress bar and clear indeterminate mode.
+fn progress_hide(progress: &ProgressBar, indeterminate: &Rc<Cell<bool>>) {
+    indeterminate.set(false);
+    progress.set_visible(false);
+    progress.set_text(None);
+}
+
+/// The unified progress affordance, bundling the bar with its indeterminate
+/// flag so the two always travel together. Cloning is cheap (a GObject
+/// refcount plus an `Rc`).
+#[derive(Clone)]
+struct ProgressUi {
+    bar: ProgressBar,
+    indeterminate: Rc<Cell<bool>>,
+}
+
+impl ProgressUi {
+    fn pulse_start(&self) {
+        progress_pulse_start(&self.bar, &self.indeterminate);
+    }
+    fn hide(&self) {
+        progress_hide(&self.bar, &self.indeterminate);
+    }
+}
+
 /// Confirm dialog for following a series. Prefills the label and match phrase
 /// from the normalised subject and lets the user tweak them before saving.
 fn open_follow_dialog(
@@ -1426,7 +1536,7 @@ fn open_follow_dialog(
     state: &Rc<RefCell<AppState>>,
     sidebar_model: &ListStore,
     default_profile: &str,
-    spinner: &Spinner,
+    progress: &ProgressUi,
     status: &Label,
     subject: &str,
 ) {
@@ -1489,7 +1599,7 @@ fn open_follow_dialog(
     let state_c = state.clone();
     let sbmodel_c = sidebar_model.clone();
     let defprofile_c = default_profile.to_string();
-    let spinner_c = spinner.clone();
+    let progress_c = progress.clone();
     let status_c = status.clone();
     let dialog_c = dialog.clone();
     let label_entry_c = label_entry.clone();
@@ -1525,12 +1635,12 @@ fn open_follow_dialog(
         if inbox_check_c.is_active() && s.active_is_inbox() {
             if let Some(base) = s.inbox_base_query() {
                 let q = s.augment_inbox_query(&base);
-                spinner_c.set_spinning(true);
+                progress_c.pulse_start();
                 let profile = s.active_profile.borrow().clone();
                 if let Err(e) =
                     s.request_search(q, PendingDesc::View { name: "inbox".to_string(), profile })
                 {
-                    spinner_c.set_spinning(false);
+                    progress_c.hide();
                     status_c.set_text(&format!("Inbox refresh failed: {}", e));
                 }
             }
