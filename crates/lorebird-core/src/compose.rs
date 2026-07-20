@@ -132,12 +132,12 @@ impl Mail {
             out.push_str(&format!("Bcc: {}\n", self.bcc));
         }
         out.push_str(&format!("Subject: {}\n", self.subject));
-        out.push_str(&format!("Message-ID: {}\n", self.message_id_header()));
+        out.push_str(&format!("Message-ID: {}\n", wrap_msgid(&self.message_id_header())));
         if let Some(ref irt) = self.in_reply_to {
-            out.push_str(&format!("In-Reply-To: {}\n", irt));
+            out.push_str(&format!("In-Reply-To: {}\n", wrap_msgid_list(irt)));
         }
         if let Some(ref refs) = self.references {
-            out.push_str(&format!("References: {}\n", refs));
+            out.push_str(&format!("References: {}\n", wrap_msgid_list(refs)));
         }
 
         // ── MIME / X-Mailer (emit if user hasn't overridden) ──
@@ -228,6 +228,31 @@ impl Mail {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────
+
+/// Wrap a single message id in angle brackets if it lacks them.
+///
+/// RFC 5322 message ids are `<id@host>`, and public-inbox / lore strict
+/// threading only matches bracketed ids. `mail_parser` yields ids without the
+/// brackets, so a reply built from a parsed parent would emit bracket-less
+/// `In-Reply-To` / `References` and thread loosely (by subject) instead. This
+/// restores the brackets on the way out and is idempotent for ids that already
+/// have them.
+fn wrap_msgid(id: &str) -> String {
+    let t = id.trim();
+    if t.starts_with('<') && t.ends_with('>') && t.len() >= 2 {
+        t.to_string()
+    } else {
+        format!("<{}>", t.trim_matches(|c| c == '<' || c == '>'))
+    }
+}
+
+/// Wrap every whitespace-separated id in a `References` / `In-Reply-To` value.
+fn wrap_msgid_list(ids: &str) -> String {
+    ids.split_whitespace()
+        .map(wrap_msgid)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 /// Generate a unique Message-ID in the style of `git send-email`:
 ///
@@ -526,6 +551,32 @@ mod tests {
         assert!(rfc.contains("X-Custom: value\n"));
         // Blank line + body
         assert!(rfc.contains("\nHello\n"));
+    }
+
+    #[test]
+    fn to_rfc2822_brackets_bare_reply_ids() {
+        // A reply built from a mail_parser-parsed parent carries bracket-less
+        // ids; they must be bracketed on the way out so lore strict-threads.
+        let mail = Mail {
+            from: "Bob <bob@example.com>".to_string(),
+            to: "Alice <alice@example.com>".to_string(),
+            cc: String::new(),
+            bcc: String::new(),
+            subject: "Re: Test".to_string(),
+            date: Some("Thu, 29 May 2025 10:00:00 +0000".to_string()),
+            message_id: Some("gen.0-bob@example.com".to_string()),
+            in_reply_to: Some("parent@example.com".to_string()),
+            references: Some("grandparent@example.com parent@example.com".to_string()),
+            body_text: "Hi\n".to_string(),
+            headers: HashMap::new(),
+        };
+        let rfc = mail.to_rfc2822();
+        assert!(rfc.contains("Message-ID: <gen.0-bob@example.com>\n"), "{rfc}");
+        assert!(rfc.contains("In-Reply-To: <parent@example.com>\n"), "{rfc}");
+        assert!(
+            rfc.contains("References: <grandparent@example.com> <parent@example.com>\n"),
+            "{rfc}"
+        );
     }
 
     #[test]
