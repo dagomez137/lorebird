@@ -183,27 +183,46 @@ impl AppState {
         }
     }
 
-    /// Archive the entire series of `subject` (all editions). Returns the
-    /// number of newly archived messages.
-    pub fn archive_series(&self, subject: &str) -> Result<usize, String> {
+    /// Archive the series of `subject` (all editions) plus every message id in
+    /// `thread_ids` (the selected thread). The subject match alone misses a
+    /// patch series' siblings, whose subjects differ, so the thread's own ids
+    /// are archived too. Returns the number of newly archived messages.
+    pub fn archive_series(&self, subject: &str, thread_ids: &[String]) -> Result<usize, String> {
         let key = lorebird_core::series::series_key(subject);
-        if key.is_empty() {
+        if key.is_empty() && thread_ids.is_empty() {
             return Err("could not derive a series from this subject".to_string());
         }
         let db = self.db.borrow();
         let conn = db.as_ref().ok_or("no index open")?;
-        lorebird_core::archive::archive_series(conn, &key).map_err(|e| e.to_string())
+        let mut n = 0;
+        if !key.is_empty() {
+            n += lorebird_core::archive::archive_series(conn, &key).map_err(|e| e.to_string())?;
+        }
+        if !thread_ids.is_empty() {
+            n += lorebird_core::archive::archive_message_ids(conn, thread_ids)
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(n)
     }
 
-    /// Unarchive the entire series of `subject`. Returns the number removed.
-    pub fn unarchive_series(&self, subject: &str) -> Result<usize, String> {
+    /// Unarchive the series of `subject` plus `thread_ids`. Returns the number
+    /// removed.
+    pub fn unarchive_series(&self, subject: &str, thread_ids: &[String]) -> Result<usize, String> {
         let key = lorebird_core::series::series_key(subject);
-        if key.is_empty() {
+        if key.is_empty() && thread_ids.is_empty() {
             return Err("could not derive a series from this subject".to_string());
         }
         let db = self.db.borrow();
         let conn = db.as_ref().ok_or("no index open")?;
-        lorebird_core::archive::unarchive_series(conn, &key).map_err(|e| e.to_string())
+        let mut n = 0;
+        if !key.is_empty() {
+            n += lorebird_core::archive::unarchive_series(conn, &key).map_err(|e| e.to_string())?;
+        }
+        if !thread_ids.is_empty() {
+            n += lorebird_core::archive::unarchive_message_ids(conn, thread_ids)
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(n)
     }
 
     /// Re-dispatch the currently active view/search so the list reflects a

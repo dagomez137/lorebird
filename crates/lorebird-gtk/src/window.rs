@@ -879,13 +879,17 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     let context_menu_for_archive = context_menu.clone();
     archive_menu_btn.connect_clicked(move |_btn| {
         context_menu_for_archive.popdown();
-        let subject = selected_for_archive.borrow().as_ref().map(|n| n.subject());
-        let Some(subject) = subject.filter(|s| !s.is_empty()) else {
+        let sel = selected_for_archive.borrow();
+        let Some(node) = sel.as_ref() else {
             status_for_archive.set_text("Select a thread to archive its series");
             return;
         };
+        let subject = node.subject();
+        let mut ids = Vec::new();
+        collect_thread_message_ids(node, &mut ids);
+        drop(sel);
         let s = state_for_archive.borrow();
-        match s.archive_series(&subject) {
+        match s.archive_series(&subject, &ids) {
             Ok(n) => {
                 status_for_archive.set_text(&format!("Archived {} message(s)", n));
                 progress_pulse_start(&progress_for_archive, &indeterminate_for_archive);
@@ -907,13 +911,17 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     let context_menu_for_unarchive = context_menu.clone();
     unarchive_menu_btn.connect_clicked(move |_btn| {
         context_menu_for_unarchive.popdown();
-        let subject = selected_for_unarchive.borrow().as_ref().map(|n| n.subject());
-        let Some(subject) = subject.filter(|s| !s.is_empty()) else {
+        let sel = selected_for_unarchive.borrow();
+        let Some(node) = sel.as_ref() else {
             status_for_unarchive.set_text("Select a thread to unarchive its series");
             return;
         };
+        let subject = node.subject();
+        let mut ids = Vec::new();
+        collect_thread_message_ids(node, &mut ids);
+        drop(sel);
         let s = state_for_unarchive.borrow();
-        match s.unarchive_series(&subject) {
+        match s.unarchive_series(&subject, &ids) {
             Ok(n) => {
                 status_for_unarchive.set_text(&format!("Unarchived {} message(s)", n));
                 progress_pulse_start(&progress_for_unarchive, &indeterminate_for_unarchive);
@@ -1491,6 +1499,21 @@ fn build_sidebar(state: &AppState) -> (ScrolledWindow, ListStore, gtk4::ListBox)
 
     scrolled.set_child(Some(&list_box));
     (scrolled, sidebar_model, list_box)
+}
+
+/// Collect a thread node's message id and every descendant's, so archiving can
+/// cover a whole thread (e.g. a patch series whose siblings differ in subject).
+fn collect_thread_message_ids(node: &ThreadNode, out: &mut Vec<String>) {
+    let mid = node.message_id();
+    if !mid.is_empty() {
+        out.push(mid);
+    }
+    let children = node.children_store();
+    for i in 0..children.n_items() {
+        if let Some(child) = children.item(i).and_downcast::<ThreadNode>() {
+            collect_thread_message_ids(&child, out);
+        }
+    }
 }
 
 /// Rebuild the "Followed" section of the sidebar model in place: remove any

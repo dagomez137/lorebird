@@ -32,6 +32,32 @@ pub fn archive_series(conn: &Connection, series_key: &str) -> SqlResult<usize> {
     )
 }
 
+/// Archive an explicit set of message ids (e.g. every message in a thread).
+///
+/// Complements [`archive_series`]: a patch series threads its cover and each
+/// `[PATCH n/m]` under one thread, but the patches have distinct subjects, so a
+/// subject-key match alone leaves them unarchived and the thread lingers in
+/// filtered views. Archiving the thread's ids clears it. Returns the number of
+/// newly archived ids (`INSERT OR IGNORE` skips ones already archived).
+pub fn archive_message_ids(conn: &Connection, ids: &[String]) -> SqlResult<usize> {
+    let mut stmt = conn.prepare("INSERT OR IGNORE INTO archived (message_id) VALUES (?1)")?;
+    let mut n = 0;
+    for id in ids {
+        n += stmt.execute(params![id])?;
+    }
+    Ok(n)
+}
+
+/// Unarchive an explicit set of message ids. Returns the number removed.
+pub fn unarchive_message_ids(conn: &Connection, ids: &[String]) -> SqlResult<usize> {
+    let mut stmt = conn.prepare("DELETE FROM archived WHERE message_id = ?1")?;
+    let mut n = 0;
+    for id in ids {
+        n += stmt.execute(params![id])?;
+    }
+    Ok(n)
+}
+
 /// Load the full set of archived message ids.
 ///
 /// The `archived` table is small (only explicitly archived series), so the
@@ -91,6 +117,25 @@ mod tests {
 
         let removed = unarchive_series(&conn, "nvme updates for Linux").unwrap();
         assert_eq!(removed, 2);
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM archived", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn archive_and_unarchive_explicit_ids() {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::init_db(&conn).unwrap();
+
+        let ids = ["cover@x".to_string(), "p1@x".to_string(), "p2@x".to_string()];
+        let n = archive_message_ids(&conn, &ids).unwrap();
+        assert_eq!(n, 3);
+        // Re-archiving is idempotent (INSERT OR IGNORE).
+        assert_eq!(archive_message_ids(&conn, &ids).unwrap(), 0);
+
+        let removed = unarchive_message_ids(&conn, &ids).unwrap();
+        assert_eq!(removed, 3);
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM archived", [], |r| r.get(0))
             .unwrap();
