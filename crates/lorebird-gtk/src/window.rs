@@ -2262,8 +2262,24 @@ fn build_preview_pane(labels: &PreviewLabels) -> Box {
     body_view.set_right_margin(4);
     body_view.set_top_margin(4);
     body_view.set_bottom_margin(4);
-    body_view.set_show_line_numbers(true);
     body_view.set_monospace(true);
+
+    // Built-in line numbers size the gutter to the buffer's line-count width,
+    // so a 5-line and a 5000-line message start their text at different x. Use
+    // a custom text renderer with a constant width instead.
+    body_view.set_show_line_numbers(false);
+    let gutter = sv::prelude::ViewExt::gutter(&body_view, gtk4::TextWindowType::Left);
+    let lines = sv::GutterRendererText::new();
+    lines.set_xalign(1.0);
+    lines.set_xpad(4);
+    lines.set_alignment_mode(sv::GutterRendererAlignmentMode::Cell);
+    // Fixed budget of 5 digits: patch and email bodies never reach 100k lines.
+    let char_px = monospace_char_px(&body_view);
+    lines.set_width_request(char_px * LINE_NUMBER_DIGITS + LINE_NUMBER_GUTTER_PAD_PX);
+    lines.connect_query_data(move |renderer, _obj, line| {
+        renderer.set_text(&(line + 1).to_string());
+    });
+    gutter.insert(&lines, 0);
 
     scrolled.set_child(Some(&body_view));
     vbox.append(&scrolled);
@@ -2295,6 +2311,12 @@ fn make_header_key(text: &str) -> Label {
 /// Length past which a From/To/Cc value is truncated in the collapsed view.
 const HEADER_TRUNCATE_MAX: usize = 120;
 
+/// Digits the body line-number gutter reserves, fixing its width so text always
+/// starts at the same x. A number wider than this pushes into the body margin.
+const LINE_NUMBER_DIGITS: i32 = 5;
+/// Padding added to the digit budget for the gutter's xpad on both sides.
+const LINE_NUMBER_GUTTER_PAD_PX: i32 = 12;
+
 /// Default width of the folder sidebar, in pixels.
 const SIDEBAR_WIDTH: i32 = 168;
 
@@ -2315,14 +2337,18 @@ const STATUS_PROGRESS_WIDTH: i32 = 200;
 /// Pixel width that fits `columns` monospace characters in the reading pane,
 /// with an allowance for the body's line-number gutter, margins and scrollbar.
 fn reading_pane_width_px(widget: &impl glib::object::IsA<gtk4::Widget>, columns: i32) -> i32 {
+    monospace_char_px(widget) * columns + 96
+}
+
+/// Pixel advance of one monospace character in `widget`'s Pango context.
+fn monospace_char_px(widget: &impl glib::object::IsA<gtk4::Widget>) -> i32 {
     let ctx = widget.pango_context();
     let mut desc = ctx
         .font_description()
         .unwrap_or_else(|| gtk4::pango::FontDescription::from_string("Monospace 11"));
     desc.set_family("Monospace");
     let metrics = ctx.metrics(Some(&desc), None);
-    let char_px = (metrics.approximate_char_width() / gtk4::pango::SCALE).max(7);
-    char_px * columns + 96
+    (metrics.approximate_char_width() / gtk4::pango::SCALE).max(7)
 }
 
 /// Display name of a From header, dropping the `<address>`. With no name, falls
