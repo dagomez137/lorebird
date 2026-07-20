@@ -542,6 +542,7 @@ config = {
 | `user` | table? | Global default `name` and `email` for profiles that don't define their own |
 | `theme` | string | `"light"` (default) or `"dark"` |
 | `ui_scale` | number | UI scale factor, `1.0` = no scaling |
+| `editor` | table? | External editor for the compose body (see [External editor](#external-editor)) |
 | `profiles` | table | Map of profile label → profile config |
 | `on_reply` | function? | Global reply hook |
 | `on_send` | function? | Global send hook |
@@ -564,3 +565,39 @@ Each profile resolves its `name` and `email` using this priority:
 1. Per-profile `name` / `email` (highest)
 2. Global `user.name` / `user.email`
 3. Fallback defaults: `"Anonymous"` / `"unknown@localhost"` (lowest)
+
+### External editor
+
+Set `editor` to edit the compose BODY in an external editor. Only the body
+round-trips through the editor; the header fields (To/Cc/Subject) stay in the
+compose window UI. When an editor is configured the compose window gains an
+"Edit body" button, and with `on_open = true` the editor also opens
+automatically when a reply or new message is composed.
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `command` | table | *(required)* argv template. `{file}` is replaced with the temp-file path; if absent, the path is appended as the last argument |
+| `on_open` | bool | Launch the editor automatically when the compose window opens (default `false`) |
+| `file_suffix` | string | Temp-file suffix so the editor can pick a filetype (default `".eml"`) |
+
+Because a TUI editor such as `hx`, `vim`, or `nvim` needs a terminal that the
+GTK process cannot provide, `command` must open one. Use a GUI terminal that
+runs in the foreground and exits when the editor exits (Alacritty, Kitty,
+WezTerm). macOS `Terminal.app` is not supported here: it does not block, so
+LoreBird cannot tell when editing finished.
+
+```lua
+-- Helix inside Alacritty; edits the body, syncs back on exit.
+editor = {
+  command = { "alacritty", "--command", "hx", "{file}" },
+  on_open = true,
+  file_suffix = ".eml",
+}
+
+-- Kitty runs the program directly, no execute flag needed.
+editor = { command = { "kitty", "nvim", "{file}" } }
+```
+
+While the editor is open the compose body is read-only and Send / Save Draft /
+Discard are disabled, so the two buffers cannot diverge. If the editor command
+cannot be launched, an error is shown and the in-window editor stays usable.

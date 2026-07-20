@@ -103,6 +103,9 @@ pub struct AppState {
     /// (config `contact_groups`).
     pub contact_groups: Vec<lorebird_lua::ContactGroup>,
 
+    /// Optional external editor for the compose body (config `editor`).
+    pub editor: Option<lorebird_lua::EditorConfig>,
+
     /// Followed series (persisted to follows.json), shown in the sidebar
     /// and optionally merged into the inbox view.
     pub follows: RefCell<Vec<Follow>>,
@@ -131,6 +134,7 @@ impl AppState {
                     reading_pane_columns: lorebird_lua::DEFAULT_READING_PANE_COLUMNS,
                     compact_list: false,
                     contact_groups: Vec::new(),
+                    editor: None,
                     has_on_reply: false,
                     has_on_send: false,
                 }
@@ -157,6 +161,7 @@ impl AppState {
             reading_pane_columns: init.reading_pane_columns,
             compact_list: init.compact_list,
             contact_groups: init.contact_groups,
+            editor: init.editor,
             follows: RefCell::new(lorebird_core::follows::load()),
             active_is_inbox: Cell::new(false),
         }

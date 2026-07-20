@@ -67,6 +67,23 @@ pub struct ContactGroup {
     pub patterns: Vec<String>,
 }
 
+/// External editor for the compose body. `command` is an argv template that
+/// must open a terminal running the editor, since a TUI editor like `hx` needs
+/// a tty the GTK process cannot provide (e.g. `{ "alacritty", "--command",
+/// "hx", "{file}" }`). The `{file}` element is replaced with the temp-file
+/// path; if it is absent the path is appended as the last argument. Only the
+/// body round-trips through the editor; headers stay in the UI.
+#[derive(Debug, Clone, Deserialize)]
+pub struct EditorConfig {
+    pub command: Vec<String>,
+    /// Launch the editor automatically when the compose window opens.
+    #[serde(default)]
+    pub on_open: bool,
+    /// Temp-file suffix so the editor can pick a filetype. Defaults to `.eml`.
+    #[serde(default = "default_editor_file_suffix")]
+    pub file_suffix: String,
+}
+
 /// Top-level config data (deserialisable from Lua, **excludes** hooks).
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
@@ -104,6 +121,10 @@ pub struct AppConfig {
     /// Address groups coloured as pills in the recipient fields.
     #[serde(default)]
     pub contact_groups: Vec<ContactGroup>,
+    /// Optional external editor for the compose body. Absent disables the
+    /// feature and the body is edited in the in-window editor only.
+    #[serde(default)]
+    pub editor: Option<EditorConfig>,
     pub profiles: HashMap<String, ProfileData>,
 }
 
@@ -129,6 +150,10 @@ fn default_working_set_limit() -> usize {
 
 fn default_reading_pane_columns() -> usize {
     DEFAULT_READING_PANE_COLUMNS
+}
+
+fn default_editor_file_suffix() -> String {
+    ".eml".to_string()
 }
 
 // ── Hook types (Lua function handles) ──────────────────────────────
@@ -304,6 +329,7 @@ mod tests {
             reading_pane_columns: DEFAULT_READING_PANE_COLUMNS,
             compact_list: false,
             contact_groups: Vec::new(),
+            editor: None,
             profiles: {
                 let mut m = HashMap::new();
                 m.insert(

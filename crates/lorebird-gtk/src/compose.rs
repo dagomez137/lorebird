@@ -4,24 +4,31 @@
 //! entries and a SourceView body editor pre-filled from a `Mail`.
 //! The Send button dispatches `on_send` via the Lua thread.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::ffi::{OsStr, OsString};
+use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use gtk4::prelude::*;
 use gtk4::{
-    ApplicationWindow, Box, Entry, HeaderBar, Label, Orientation, ScrolledWindow,
+    ApplicationWindow, Box, Button, Entry, HeaderBar, Label, Orientation, ScrolledWindow,
     Separator, Spinner,
 };
 use sourceview5 as sv;
 use sourceview5::prelude::*;
 
 use lorebird_core::compose::Mail;
+use lorebird_lua::EditorConfig;
 
 use crate::app_state::AppState;
 use crate::lua_thread::LuaCommand;
 use crate::lua_thread::LuaResult;
 use crate::thread_node::ThreadNode;
+
+/// Unique-suffix counter for compose temp files handed to the external editor.
+static EDITOR_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 // ── Data passed from the reply trigger to the compose window ────────
 
@@ -45,6 +52,7 @@ pub fn open_compose_window(app: &gtk4::Application, state: &Rc<RefCell<AppState>
     let is_dark = ctx.is_dark;
     let profile_label = ctx.profile_label.clone();
     let mail = ctx.mail;
+    let editor_cfg = state.borrow().editor.clone();
 
     // ── Window ───────────────────────────────────────────────────
     let window = ApplicationWindow::builder()
@@ -68,6 +76,10 @@ pub fn open_compose_window(app: &gtk4::Application, state: &Rc<RefCell<AppState>
     discard_btn.add_css_class("destructive-action");
     discard_btn.set_tooltip_text(Some("Discard this message"));
 
+    // Only shown when an external editor is configured.
+    let edit_btn = gtk4::Button::with_label("Edit body");
+    edit_btn.set_tooltip_text(Some("Edit the message body in your external editor"));
+
     let spinner = Spinner::new();
     spinner.set_spinning(false);
 
@@ -79,6 +91,9 @@ pub fn open_compose_window(app: &gtk4::Application, state: &Rc<RefCell<AppState>
     header.pack_end(&discard_btn);
     header.pack_end(&save_draft_btn);
     header.pack_end(&send_btn);
+    if editor_cfg.is_some() {
+        header.pack_end(&edit_btn);
+    }
     header.pack_end(&spinner);
     window.set_titlebar(Some(&header));
 
@@ -156,6 +171,41 @@ pub fn open_compose_window(app: &gtk4::Application, state: &Rc<RefCell<AppState>
         let mark = scroll_buffer.get_insert();
         scroll_view.scroll_to_mark(&mark, 0.0, true, 0.0, 1.0);
     });
+
+    // ── External editor (body only) ─────────────────────────────
+    // Round-trip the body through the user's editor. Headers stay in the UI.
+    if let Some(cfg) = editor_cfg.clone() {
+        let ui = EditorUi {
+            body_buffer: body_buffer.clone(),
+            body_view: body_view.clone(),
+            status: status_label.clone(),
+            send: send_btn.clone(),
+            save: save_draft_btn.clone(),
+            discard: discard_btn.clone(),
+            edit: edit_btn.clone(),
+            editing: Rc::new(Cell::new(false)),
+            tmp: Rc::new(RefCell::new(None)),
+        };
+
+        let ui_click = ui.clone();
+        let cfg_click = cfg.clone();
+        edit_btn.connect_clicked(move |_btn| launch_external_editor(&ui_click, &cfg_click));
+
+        // Delete a leftover temp file if the window closes while editing.
+        let tmp_close = ui.tmp.clone();
+        window.connect_close_request(move |_win| {
+            if let Some(p) = tmp_close.borrow_mut().take() {
+                let _ = std::fs::remove_file(p);
+            }
+            glib::Propagation::Proceed
+        });
+
+        // Auto-launch once the window is laid out, if configured.
+        if cfg.on_open {
+            let ui_open = ui.clone();
+            glib::idle_add_local_once(move || launch_external_editor(&ui_open, &cfg));
+        }
+    }
 
     // ── Save Draft button handler ───────────────────────────────
     // Clone the field widgets first; the Send closure moves its copies.
@@ -348,6 +398,133 @@ pub fn open_compose_window(app: &gtk4::Application, state: &Rc<RefCell<AppState>
     window.present();
 }
 
+// ── External editor ─────────────────────────────────────────────────
+
+/// Widgets the external-editor round-trip touches, bundled so the launch
+/// helper and its async callback can share one handle.
+#[derive(Clone)]
+struct EditorUi {
+    body_buffer: sv::Buffer,
+    body_view: sv::View,
+    status: Label,
+    send: Button,
+    save: Button,
+    discard: Button,
+    edit: Button,
+    /// Guards against launching a second editor while one is open.
+    editing: Rc<Cell<bool>>,
+    /// The temp file currently being edited, for cleanup on window close.
+    tmp: Rc<RefCell<Option<PathBuf>>>,
+}
+
+impl EditorUi {
+    /// While the editor is open the body is read-only and the actions are
+    /// disabled, so the two buffers cannot diverge.
+    fn set_busy(&self, busy: bool) {
+        self.body_view.set_editable(!busy);
+        for b in [&self.send, &self.save, &self.discard, &self.edit] {
+            b.set_sensitive(!busy);
+        }
+    }
+
+    fn set_error(&self, msg: &str) {
+        self.status.set_text(msg);
+        self.status.remove_css_class("dim-label");
+        self.status.add_css_class("error");
+    }
+}
+
+/// Write the body to a temp file, spawn the configured editor command on it,
+/// and read the file back into the body buffer when the editor exits. Only the
+/// body is edited; headers stay in the UI.
+fn launch_external_editor(ui: &EditorUi, cfg: &EditorConfig) {
+    if ui.editing.get() {
+        return;
+    }
+
+    let start = ui.body_buffer.start_iter();
+    let end = ui.body_buffer.end_iter();
+    let body = ui.body_buffer.text(&start, &end, false).to_string();
+
+    let path = match write_body_tmpfile(&body, &cfg.file_suffix) {
+        Ok(p) => p,
+        Err(e) => {
+            ui.set_error(&format!("Editor temp file failed: {}", e));
+            return;
+        }
+    };
+
+    let argv = build_argv(&cfg.command, &path);
+    let argv_os: Vec<OsString> = argv.iter().map(OsString::from).collect();
+    let argv_ref: Vec<&OsStr> = argv_os.iter().map(OsString::as_os_str).collect();
+    let proc = match gtk4::gio::Subprocess::newv(&argv_ref, gtk4::gio::SubprocessFlags::NONE) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = std::fs::remove_file(&path);
+            ui.set_error(&format!("Cannot launch editor: {}", e));
+            return;
+        }
+    };
+
+    ui.editing.set(true);
+    *ui.tmp.borrow_mut() = Some(path.clone());
+    ui.set_busy(true);
+    ui.status.remove_css_class("error");
+    ui.status.add_css_class("dim-label");
+    ui.status.set_text("Editing in external editor\u{2026}");
+
+    let ui = ui.clone();
+    // Keep the subprocess alive until the wait completes; ignore its exit code
+    // and read the file back regardless (the user may have written then quit
+    // with a non-zero status).
+    let keep = proc.clone();
+    proc.wait_async(None::<&gtk4::gio::Cancellable>, move |_res| {
+        let _ = &keep;
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                ui.body_buffer.set_text(&text);
+                ui.status.set_text("");
+            }
+            Err(e) => ui.set_error(&format!("Could not read edited body: {}", e)),
+        }
+        let _ = std::fs::remove_file(&path);
+        *ui.tmp.borrow_mut() = None;
+        ui.editing.set(false);
+        ui.set_busy(false);
+    });
+}
+
+/// Expand a command template into an argv, substituting `{file}` with the temp
+/// file path. If no element contains the placeholder the path is appended.
+fn build_argv(command: &[String], file: &std::path::Path) -> Vec<String> {
+    let file_str = file.to_string_lossy();
+    let mut used = false;
+    let mut argv: Vec<String> = command
+        .iter()
+        .map(|a| {
+            if a.contains("{file}") {
+                used = true;
+                a.replace("{file}", &file_str)
+            } else {
+                a.clone()
+            }
+        })
+        .collect();
+    if !used {
+        argv.push(file_str.into_owned());
+    }
+    argv
+}
+
+/// Write the body to a fresh temp file under `$TMPDIR` and return its path.
+fn write_body_tmpfile(body: &str, suffix: &str) -> std::io::Result<PathBuf> {
+    let n = EDITOR_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let name = format!("lorebird-compose-{}-{}{}", std::process::id(), n, suffix);
+    let path = std::env::temp_dir().join(name);
+    std::fs::write(&path, body)?;
+    Ok(path)
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────
 
 /// Create a labelled header row (e.g. "From: [...]") and return the entry.
@@ -372,4 +549,36 @@ fn make_header_row(parent: &Box, label: &str, value: &str) -> Entry {
 
     parent.append(&hbox);
     entry
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_argv;
+    use std::path::Path;
+
+    #[test]
+    fn build_argv_substitutes_placeholder() {
+        let cmd = vec![
+            "alacritty".to_string(),
+            "--command".to_string(),
+            "hx".to_string(),
+            "{file}".to_string(),
+        ];
+        let argv = build_argv(&cmd, Path::new("/tmp/body.eml"));
+        assert_eq!(argv, ["alacritty", "--command", "hx", "/tmp/body.eml"]);
+    }
+
+    #[test]
+    fn build_argv_appends_when_placeholder_absent() {
+        let cmd = vec!["hx".to_string()];
+        let argv = build_argv(&cmd, Path::new("/tmp/body.eml"));
+        assert_eq!(argv, ["hx", "/tmp/body.eml"]);
+    }
+
+    #[test]
+    fn build_argv_substitutes_within_argument() {
+        let cmd = vec!["wrapper".to_string(), "--edit={file}".to_string()];
+        let argv = build_argv(&cmd, Path::new("/tmp/b.eml"));
+        assert_eq!(argv, ["wrapper", "--edit=/tmp/b.eml"]);
+    }
 }
