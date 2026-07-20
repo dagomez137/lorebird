@@ -516,13 +516,36 @@ fn build_argv(command: &[String], file: &std::path::Path) -> Vec<String> {
     argv
 }
 
-/// Write the body to a fresh temp file under `$TMPDIR` and return its path.
+/// Write the body to a fresh temp file and return its path.
+///
+/// Tries the system temp dir first, creating it if missing: under a `nix
+/// develop` shell `$TMPDIR` points at a per-shell directory that may already
+/// be gone, so a bare write there fails with ENOENT. Falls back to the app
+/// config dir, which always exists, so the feature works regardless of how the
+/// process was launched.
 fn write_body_tmpfile(body: &str, suffix: &str) -> std::io::Result<PathBuf> {
     let n = EDITOR_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let name = format!("lorebird-compose-{}-{}{}", std::process::id(), n, suffix);
-    let path = std::env::temp_dir().join(name);
-    std::fs::write(&path, body)?;
-    Ok(path)
+
+    let mut candidates: Vec<PathBuf> = vec![std::env::temp_dir()];
+    if let Some(confdir) = lorebird_core::config_dir::lorebird_confdir() {
+        candidates.push(confdir.join("compose-tmp"));
+    }
+
+    let mut last_err = None;
+    for dir in candidates {
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            last_err = Some(e);
+            continue;
+        }
+        let path = dir.join(&name);
+        match std::fs::write(&path, body) {
+            Ok(()) => return Ok(path),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err
+        .unwrap_or_else(|| std::io::Error::other("no writable temp directory")))
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
