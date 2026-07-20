@@ -1838,6 +1838,9 @@ fn build_center_pane(
     let message_id_label = Label::new(Some(""));
     message_id_label.set_xalign(0.0);
     message_id_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    // Pin the ellipsized minimum to a few characters so a long unbreakable id
+    // cannot raise the reading pane's minimum and move the divider.
+    message_id_label.set_width_chars(3);
     message_id_label.set_selectable(true);
     let body_buffer = sv::Buffer::new(None::<&gtk4::TextTagTable>);
     body_buffer.set_highlight_syntax(true);
@@ -2469,9 +2472,12 @@ fn make_chip_field(expanded: bool) -> ChipField {
 
     let scroll = ScrolledWindow::new();
     // Keep the field's natural width from widening the reading pane, but let it
-    // grow as tall as the wrapped chips need.
+    // grow as tall as the wrapped chips need. A zero minimum content width makes
+    // the field width-neutral even in the expanded PolicyType::Never state,
+    // where the ScrolledWindow otherwise passes its child minimum straight up.
     scroll.set_propagate_natural_width(false);
     scroll.set_propagate_natural_height(true);
+    scroll.set_min_content_width(0);
     scroll.set_child(Some(&flow));
     let field = ChipField { flow, scroll };
     apply_chip_expand(&field.scroll, expanded);
@@ -2515,6 +2521,12 @@ fn render_recipient_chips(flow: &FlowBox, value: &str, groups: &[ContactGroup]) 
         chip.add_css_class("pill");
         chip.set_tooltip_text(Some(part));
         chip.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        // width_chars pins the ellipsized minimum to a few characters. Without
+        // it some GTK versions report max_width_chars as the minimum, so a wide
+        // recipient would raise the preview minimum past its floor and shove the
+        // GtkPaned divider. max_width_chars stays the natural cap; the full
+        // `Name <addr>` remains in the tooltip.
+        chip.set_width_chars(3);
         chip.set_max_width_chars(48);
         match contact_group_for(recipient_address(part), groups)
             .and_then(|g| resolve_pill_color(&g.color))
