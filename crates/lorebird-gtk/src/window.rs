@@ -2351,6 +2351,11 @@ const THREAD_LIST_MIN_WIDTH: i32 = 320;
 /// Default width of the thread list when the window first opens, in pixels.
 const THREAD_LIST_DEFAULT_WIDTH: i32 = 520;
 
+/// Height cap for a recipient chip field, in pixels. Beyond it the field
+/// scrolls, so many recipients cannot force the window taller. About five
+/// wrapped rows.
+const CHIP_FIELD_MAX_HEIGHT: i32 = 140;
+
 /// Fixed width of the bottom status text, in characters. The label ellipsizes
 /// so a long query description truncates in place instead of resizing the row.
 const STATUS_TEXT_CHARS: i32 = 48;
@@ -2527,6 +2532,13 @@ fn make_chip_field(expanded: bool) -> ChipField {
     scroll.set_propagate_natural_width(false);
     scroll.set_propagate_natural_height(true);
     scroll.set_min_content_width(0);
+    // A zero minimum content height keeps an empty (or scrolled) field from
+    // reserving the scroller's ~46px default, which three empty recipient rows
+    // would otherwise add to the window's minimum height.
+    scroll.set_min_content_height(0);
+    // Cap the natural height so a message with many recipients does not demand
+    // a tall window; beyond this the field scrolls (see `apply_chip_expand`).
+    scroll.set_max_content_height(CHIP_FIELD_MAX_HEIGHT);
     scroll.set_child(Some(&flow));
     let field = ChipField { flow, scroll };
     apply_chip_expand(&field.scroll, expanded);
@@ -2534,13 +2546,18 @@ fn make_chip_field(expanded: bool) -> ChipField {
 }
 
 /// Expanded wraps the chips to as many rows as needed (no horizontal scroll, so
-/// the FlowBox is width-bounded and wraps). Collapsed lays them out in one
-/// natural-width row, clipped by the scroller (`External` hides the scrollbar
-/// while still allowing the row to extend past the viewport). Per-chip tooltips
-/// keep the full `Name <addr>` reachable in both modes.
+/// the FlowBox is width-bounded and wraps) and scrolls vertically past
+/// `CHIP_FIELD_MAX_HEIGHT`. Vertical `Automatic` (rather than `Never`) is what
+/// keeps the field's *minimum* height small: with `Never` the field cannot
+/// scroll, so its minimum equals the full wrapped height, and a message with
+/// many recipients then forces the whole window taller than its allocation
+/// (the "needs at least N" measure warning). Collapsed lays the chips out in
+/// one natural-width row, clipped by the scroller (`External` hides the
+/// scrollbar while still allowing the row to extend past the viewport).
+/// Per-chip tooltips keep the full `Name <addr>` reachable in both modes.
 fn apply_chip_expand(scroll: &ScrolledWindow, expanded: bool) {
     if expanded {
-        scroll.set_policy(PolicyType::Never, PolicyType::Never);
+        scroll.set_policy(PolicyType::Never, PolicyType::Automatic);
     } else {
         scroll.set_policy(PolicyType::External, PolicyType::Never);
     }
