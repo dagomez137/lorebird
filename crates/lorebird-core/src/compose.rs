@@ -201,24 +201,23 @@ impl Mail {
         }
     }
 
-    /// Return the Date header value, generating it from the current
-    /// time if `self.date` is `None`.
+    /// Return the Date header value, generating it from the current time when
+    /// `self.date` is `None` or blank. The blank case matters because the
+    /// Mail → Lua-table → Mail roundtrip in the send path turns a `None` date
+    /// into `Some("")`, which would otherwise emit an empty `Date:` header.
     fn date_header(&self) -> String {
-        match &self.date {
-            Some(d) => d.clone(),
-            None => {
-                let now = chrono::Local::now();
-                now.to_rfc2822()
-            }
+        match self.date.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+            Some(d) => d.to_string(),
+            None => chrono::Local::now().to_rfc2822(),
         }
     }
 
-    /// Return the Message-ID header value, generating one if
-    /// `self.message_id` is `None`.  Uses the sender's email from
+    /// Return the Message-ID header value, generating one when
+    /// `self.message_id` is `None` or blank. Uses the sender's email from
     /// `self.from` to derive the Message-ID domain.
     fn message_id_header(&self) -> String {
-        match &self.message_id {
-            Some(id) => id.clone(),
+        match self.message_id.as_deref().map(str::trim).filter(|id| !id.is_empty()) {
+            Some(id) => id.to_string(),
             None => {
                 let email = extract_email_from_from(&self.from);
                 generate_message_id(&email)
@@ -577,6 +576,33 @@ mod tests {
             rfc.contains("References: <grandparent@example.com> <parent@example.com>\n"),
             "{rfc}"
         );
+    }
+
+    #[test]
+    fn to_rfc2822_blank_date_and_msgid_are_generated() {
+        // The send-path roundtrip (Mail -> Lua table -> Mail) turns a None date
+        // into Some(""), which must still emit a real Date, not an empty one.
+        let mail = Mail {
+            from: "Bob <bob@example.com>".to_string(),
+            to: "Alice <alice@example.com>".to_string(),
+            cc: String::new(),
+            bcc: String::new(),
+            subject: "Re: Test".to_string(),
+            date: Some("   ".to_string()),
+            message_id: Some(String::new()),
+            in_reply_to: None,
+            references: None,
+            body_text: "Hi\n".to_string(),
+            headers: HashMap::new(),
+        };
+        let rfc = mail.to_rfc2822();
+        assert!(!rfc.contains("Date: \n") && !rfc.contains("Date:  \n"), "{rfc}");
+        // A generated Date line is present and non-empty.
+        let date_line = rfc.lines().find(|l| l.starts_with("Date: ")).unwrap();
+        assert!(date_line.trim_start_matches("Date: ").trim().len() > 5, "{rfc}");
+        // A generated Message-ID is present and bracketed.
+        let mid_line = rfc.lines().find(|l| l.starts_with("Message-ID: ")).unwrap();
+        assert!(mid_line.contains('@') && mid_line.contains('<'), "{rfc}");
     }
 
     #[test]
