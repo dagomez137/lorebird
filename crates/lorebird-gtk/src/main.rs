@@ -18,6 +18,8 @@ use std::rc::Rc;
 use app_state::AppState;
 
 fn main() {
+    install_log_filter();
+
     // Load compiled-in resources (icons)
     gio::resources_register_include!("org.lorebird.app.gresource")
         .expect("Failed to register GResource bundle");
@@ -48,4 +50,27 @@ fn main() {
     });
 
     app.run();
+}
+
+/// Drop one specific benign GTK warning while passing every other log through.
+///
+/// GTK repeatedly emits `Trying to measure GtkApplicationWindow ... but it
+/// needs at least N` when the window is briefly allocated shorter than the
+/// reading pane's content minimum (a short window plus a message with many
+/// recipients). It is a harmless measurement probe, but it floods the console.
+/// GTK4 logs through the structured writer, so filtering needs a writer func;
+/// everything that is not this exact message is forwarded to the default
+/// writer unchanged.
+fn install_log_filter() {
+    glib::log_set_writer_func(|level, fields| {
+        let message = fields
+            .iter()
+            .find(|f| f.key() == "MESSAGE")
+            .and_then(|f| f.value_str())
+            .unwrap_or("");
+        if message.contains("Trying to measure") && message.contains("it needs at least") {
+            return glib::LogWriterOutput::Handled;
+        }
+        glib::log_writer_default(level, fields)
+    });
 }
