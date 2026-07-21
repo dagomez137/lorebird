@@ -225,6 +225,42 @@ impl AppState {
         Ok(n)
     }
 
+    /// Archive many threads' series in one DB transaction. `items` is
+    /// (subject, thread_ids) per selected top-level thread. Each subject is
+    /// mapped to its series key; entries whose key and ids are both empty are
+    /// skipped. Returns the total newly archived count. Callers run a single
+    /// [`rerun_active_view`](Self::rerun_active_view) afterwards.
+    // Wired to the multi-select bulk action UI in a follow-up commit.
+    #[allow(dead_code)]
+    pub fn archive_series_bulk(
+        &self,
+        items: &[(String, Vec<String>)],
+    ) -> Result<usize, String> {
+        let prepared = prepare_bulk_items(items);
+        if prepared.is_empty() {
+            return Ok(0);
+        }
+        let mut db = self.db.borrow_mut();
+        let conn = db.as_mut().ok_or("no index open")?;
+        lorebird_core::archive::archive_series_bulk(conn, &prepared).map_err(|e| e.to_string())
+    }
+
+    /// Unarchive many threads' series in one DB transaction. Symmetric to
+    /// [`archive_series_bulk`](Self::archive_series_bulk).
+    #[allow(dead_code)]
+    pub fn unarchive_series_bulk(
+        &self,
+        items: &[(String, Vec<String>)],
+    ) -> Result<usize, String> {
+        let prepared = prepare_bulk_items(items);
+        if prepared.is_empty() {
+            return Ok(0);
+        }
+        let mut db = self.db.borrow_mut();
+        let conn = db.as_mut().ok_or("no index open")?;
+        lorebird_core::archive::unarchive_series_bulk(conn, &prepared).map_err(|e| e.to_string())
+    }
+
     /// Re-dispatch the currently active view/search so the list reflects a
     /// change (e.g. after archiving). Falls back to All Mail.
     pub fn rerun_active_view(&self) -> Result<(), String> {
@@ -492,6 +528,23 @@ impl AppState {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
+
+/// Map each `(subject, ids)` to `(series_key, ids)`, dropping entries whose
+/// key and ids are both empty (nothing to act on).
+#[allow(dead_code)]
+fn prepare_bulk_items(items: &[(String, Vec<String>)]) -> Vec<(String, Vec<String>)> {
+    items
+        .iter()
+        .filter_map(|(subject, ids)| {
+            let key = lorebird_core::series::series_key(subject);
+            if key.is_empty() && ids.is_empty() {
+                None
+            } else {
+                Some((key, ids.clone()))
+            }
+        })
+        .collect()
+}
 
 /// Build a `ThreadNode` GObject tree from a worker-produced `PlainNode`.
 /// Rich fields (To/Cc/body/in-reply-to) are left empty and filled lazily
