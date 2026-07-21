@@ -30,6 +30,23 @@ use crate::thread_node::ThreadNode;
 use lorebird_core::compose::Mail;
 use lorebird_core::follows::Follow;
 
+// ── Multi-select (bulk archive) state ──────────────────────────────
+
+/// A thread ticked in select mode: its subject (for the series key) and the
+/// precomputed ids of the whole thread, so the bulk action needs no live node.
+struct PickedThread {
+    subject: String,
+    ids: Vec<String>,
+}
+
+/// Orthogonal "select mode" for bulk actions. Keeps its own set keyed on the
+/// root message-id, stable across the model rebuild every view run performs.
+/// Independent of the `SingleSelection` that drives preview, tint and reply.
+struct SelectMode {
+    on: Cell<bool>,
+    picked: RefCell<HashMap<String, PickedThread>>,
+}
+
 // ── Public entry point ─────────────────────────────────────────────
 
 /// Build and present the main lorebird window.
@@ -181,6 +198,56 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     meta_toggle.set_active(true);
     header.pack_start(&meta_toggle);
 
+    // ── Multi-select mode ─────────────────────────────────────
+    // A header toggle turns on per-row checkboxes and reveals a bulk-action
+    // bar. The authoritative set lives in SelectMode, keyed on root
+    // message-id so it survives the model rebuild every view run performs.
+    let select_mode = Rc::new(SelectMode {
+        on: Cell::new(false),
+        picked: RefCell::new(HashMap::new()),
+    });
+    let select_toggle = ToggleButton::new();
+    select_toggle.set_icon_name("checkbox-checked-symbolic");
+    select_toggle.set_tooltip_text(Some("Select multiple threads for bulk actions"));
+    select_toggle.add_css_class("flat");
+    header.pack_start(&select_toggle);
+
+    // Bulk-action bar, revealed only in select mode. The archive/unarchive
+    // labels carry the live selection count; a closure recomputes them.
+    let bulk_archive_btn = gtk4::Button::with_label("Archive selected (0)");
+    bulk_archive_btn.add_css_class("flat");
+    let bulk_unarchive_btn = gtk4::Button::with_label("Unarchive selected (0)");
+    bulk_unarchive_btn.add_css_class("flat");
+    let bulk_clear_btn = gtk4::Button::with_label("Clear");
+    bulk_clear_btn.add_css_class("flat");
+    let bulk_bar = Box::new(Orientation::Horizontal, 6);
+    bulk_bar.set_margin_top(4);
+    bulk_bar.set_margin_bottom(4);
+    bulk_bar.set_margin_start(8);
+    bulk_bar.set_margin_end(8);
+    bulk_bar.append(&bulk_archive_btn);
+    bulk_bar.append(&bulk_unarchive_btn);
+    bulk_bar.append(&bulk_clear_btn);
+    let bulk_revealer = gtk4::Revealer::new();
+    bulk_revealer.set_child(Some(&bulk_bar));
+    bulk_revealer.set_reveal_child(false);
+
+    // Recompute the bulk-action button labels/sensitivity from the picked set.
+    let refresh_bulk_ui: Rc<dyn Fn()> = {
+        let select_mode = select_mode.clone();
+        let archive_btn = bulk_archive_btn.clone();
+        let unarchive_btn = bulk_unarchive_btn.clone();
+        Rc::new(move || {
+            let n = select_mode.picked.borrow().len();
+            archive_btn.set_label(&format!("Archive selected ({n})"));
+            unarchive_btn.set_label(&format!("Unarchive selected ({n})"));
+            let any = n > 0;
+            archive_btn.set_sensitive(any);
+            unarchive_btn.set_sensitive(any);
+        })
+    };
+    refresh_bulk_ui();
+
     // Clones of the sidebar model for live follow/unfollow mutation, and the
     // profile that followed-series rows run against (the first, alphabetically).
     let sidebar_model_for_follow = sidebar_model.clone();
@@ -202,8 +269,13 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
             state_ref.expand_headers,
             &meta_toggle,
             state_ref.compact_list,
+            &select_toggle,
+            &select_mode,
+            &refresh_bulk_ui,
         );
     let lore_btn = preview_labels.lore_btn.clone();
+    // Bulk-action bar sits above the search/thread list, revealed in select mode.
+    center.prepend(&bulk_revealer);
     inner_paned.set_start_child(Some(&center));
     inner_paned.set_shrink_start_child(false);
 
@@ -424,6 +496,7 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     let active_folder_kind_sidebar = active_folder_kind.clone();
     let selected_node_sidebar = selected_node.clone();
     let reply_btn_sidebar = reply_btn.clone();
+    let select_toggle_sidebar = select_toggle.clone();
     let column_view_for_sidebar = thread_view.clone();
     let progress_for_sidebar = progress.clone();
     let indeterminate_for_sidebar = progress_indeterminate.clone();
@@ -448,7 +521,13 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
 
         // Clear stale selection and update header button when switching folders.
         *selected_node_sidebar.borrow_mut() = None;
-        reply_btn_sidebar.set_sensitive(!matches!(kind, FolderKind::Drafts));
+        let on_mail = !matches!(kind, FolderKind::Drafts);
+        reply_btn_sidebar.set_sensitive(on_mail);
+        // Bulk select mode is meaningless in Drafts: turn it off and disable it.
+        if !on_mail {
+            select_toggle_sidebar.set_active(false);
+        }
+        select_toggle_sidebar.set_sensitive(on_mail);
 
         let s = state_for_sidebar.borrow();
         s.set_active_is_inbox(false);
@@ -776,6 +855,18 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     unarchive_menu_btn.set_margin_bottom(4);
     unarchive_menu_btn.set_margin_start(8);
     unarchive_menu_btn.set_margin_end(8);
+    let archive_selected_btn = gtk4::Button::with_label("Archive selected series");
+    archive_selected_btn.add_css_class("flat");
+    archive_selected_btn.set_margin_top(4);
+    archive_selected_btn.set_margin_bottom(4);
+    archive_selected_btn.set_margin_start(8);
+    archive_selected_btn.set_margin_end(8);
+    let unarchive_selected_btn = gtk4::Button::with_label("Unarchive selected series");
+    unarchive_selected_btn.add_css_class("flat");
+    unarchive_selected_btn.set_margin_top(4);
+    unarchive_selected_btn.set_margin_bottom(4);
+    unarchive_selected_btn.set_margin_start(8);
+    unarchive_selected_btn.set_margin_end(8);
     let archive_separator = gtk4::Separator::new(Orientation::Horizontal);
     menu_box.append(&reply_menu_btn);
     menu_box.append(&edit_draft_btn);
@@ -784,6 +875,8 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     menu_box.append(&archive_separator);
     menu_box.append(&archive_menu_btn);
     menu_box.append(&unarchive_menu_btn);
+    menu_box.append(&archive_selected_btn);
+    menu_box.append(&unarchive_selected_btn);
     context_menu.set_child(Some(&menu_box));
 
     let state_for_ctx = state.clone();
@@ -934,6 +1027,113 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
         }
     });
 
+    // ── Bulk archive / unarchive of the multi-selected threads ─────
+    // One closure serves the action-bar buttons and the context-menu entries.
+    // `archive == false` runs the unarchive path. It gathers (subject, ids)
+    // from the picked set, guards an empty selection, applies the bulk change
+    // in a single transaction, clears the set, exits select mode, and runs one
+    // rerun_active_view so the refreshed list comes up clean.
+    let run_bulk: Rc<dyn Fn(bool)> = {
+        let state = state.clone();
+        let select_mode = select_mode.clone();
+        let select_toggle = select_toggle.clone();
+        let status = status_label.clone();
+        let progress = progress.clone();
+        let indeterminate = progress_indeterminate.clone();
+        Rc::new(move |archive: bool| {
+            let items: Vec<(String, Vec<String>)> = select_mode
+                .picked
+                .borrow()
+                .values()
+                .map(|p| (p.subject.clone(), p.ids.clone()))
+                .collect();
+            if items.is_empty() {
+                status.set_text("Select one or more threads first");
+                return;
+            }
+            let n_threads = items.len();
+            let s = state.borrow();
+            let res = if archive {
+                s.archive_series_bulk(&items)
+            } else {
+                s.unarchive_series_bulk(&items)
+            };
+            match res {
+                Ok(n) => {
+                    let verb = if archive { "Archived" } else { "Unarchived" };
+                    status.set_text(&format!("{verb} {n_threads} thread(s), {n} message(s)"));
+                    select_mode.picked.borrow_mut().clear();
+                    // Exit select mode so the rebuilt rows come up unchecked;
+                    // this also hides the checkboxes and the action bar.
+                    select_toggle.set_active(false);
+                    progress_pulse_start(&progress, &indeterminate);
+                    if let Err(e) = s.rerun_active_view() {
+                        progress_hide(&progress, &indeterminate);
+                        let noun = if archive { "Archive" } else { "Unarchive" };
+                        status.set_text(&format!("{noun} refresh failed: {e}"));
+                    }
+                }
+                Err(e) => {
+                    let noun = if archive { "Archive" } else { "Unarchive" };
+                    status.set_text(&format!("{noun} failed: {e}"));
+                }
+            }
+        })
+    };
+
+    // Select-mode toggle: reveal the action bar, or on turning off clear the
+    // picked set and untick every live top-level node so checkboxes reset.
+    let select_mode_toggle = select_mode.clone();
+    let bulk_revealer_toggle = bulk_revealer.clone();
+    let root_model_for_toggle = state_ref.root_model.clone();
+    let refresh_bulk_toggle = refresh_bulk_ui.clone();
+    select_toggle.connect_toggled(move |b| {
+        let on = b.is_active();
+        select_mode_toggle.on.set(on);
+        bulk_revealer_toggle.set_reveal_child(on);
+        if !on {
+            select_mode_toggle.picked.borrow_mut().clear();
+            for i in 0..root_model_for_toggle.n_items() {
+                if let Some(node) = root_model_for_toggle.item(i).and_downcast::<ThreadNode>() {
+                    node.set_checked(false);
+                }
+            }
+            refresh_bulk_toggle();
+        }
+    });
+
+    // Action-bar and context-menu bulk buttons.
+    let run_bulk_archive = run_bulk.clone();
+    bulk_archive_btn.connect_clicked(move |_| run_bulk_archive(true));
+    let run_bulk_unarchive = run_bulk.clone();
+    bulk_unarchive_btn.connect_clicked(move |_| run_bulk_unarchive(false));
+
+    let select_mode_clear = select_mode.clone();
+    let root_model_for_clear = state_ref.root_model.clone();
+    let refresh_bulk_clear = refresh_bulk_ui.clone();
+    bulk_clear_btn.connect_clicked(move |_| {
+        select_mode_clear.picked.borrow_mut().clear();
+        for i in 0..root_model_for_clear.n_items() {
+            if let Some(node) = root_model_for_clear.item(i).and_downcast::<ThreadNode>() {
+                node.set_checked(false);
+            }
+        }
+        refresh_bulk_clear();
+    });
+
+    let run_bulk_archive_menu = run_bulk.clone();
+    let ctx_menu_archive_sel = context_menu.clone();
+    archive_selected_btn.connect_clicked(move |_| {
+        ctx_menu_archive_sel.popdown();
+        run_bulk_archive_menu(true);
+    });
+    let run_bulk_unarchive_menu = run_bulk.clone();
+    let ctx_menu_unarchive_sel = context_menu.clone();
+    unarchive_selected_btn.connect_clicked(move |_| {
+        ctx_menu_unarchive_sel.popdown();
+        run_bulk_unarchive_menu(false);
+    });
+
     // Right-click gesture on the column view
     let ctx_menu_ref = context_menu.clone();
     let column_view_for_gesture = thread_view.clone();
@@ -943,11 +1143,14 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     let follow_menu_btn_gesture = follow_menu_btn.clone();
     let archive_menu_btn_gesture = archive_menu_btn.clone();
     let unarchive_menu_btn_gesture = unarchive_menu_btn.clone();
+    let archive_selected_gesture = archive_selected_btn.clone();
+    let unarchive_selected_gesture = unarchive_selected_btn.clone();
     let archive_sep_gesture = archive_separator.clone();
     let gesture = gtk4::GestureClick::new();
     gesture.set_button(gtk4::gdk::BUTTON_SECONDARY);
     let selected_for_gesture = selected_node.clone();
     let kind_for_gesture = active_folder_kind.clone();
+    let select_mode_gesture = select_mode.clone();
     gesture.connect_pressed(move |_gesture, _n, x, y| {
         // Don't show context menu if no row is selected.
         if selected_for_gesture.borrow().is_none() {
@@ -966,6 +1169,8 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
                 archive_sep_gesture.set_visible(false);
                 archive_menu_btn_gesture.set_visible(false);
                 unarchive_menu_btn_gesture.set_visible(false);
+                archive_selected_gesture.set_visible(false);
+                unarchive_selected_gesture.set_visible(false);
             }
             _ => {
                 reply_menu_btn_gesture.set_visible(true);
@@ -975,6 +1180,14 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
                 archive_sep_gesture.set_visible(true);
                 archive_menu_btn_gesture.set_visible(true);
                 unarchive_menu_btn_gesture.set_visible(true);
+                // Bulk entries appear only in select mode and stay insensitive
+                // until at least one thread is ticked.
+                let on = select_mode_gesture.on.get();
+                let any = !select_mode_gesture.picked.borrow().is_empty();
+                archive_selected_gesture.set_visible(on);
+                unarchive_selected_gesture.set_visible(on);
+                archive_selected_gesture.set_sensitive(any);
+                unarchive_selected_gesture.set_sensitive(any);
             }
         }
 
@@ -1800,12 +2013,16 @@ pub(crate) struct PreviewLabels {
 
 /// Build the centre pane, returning the root widget, the selection model
 /// (for wiring to the preview), and the preview labels.
+#[allow(clippy::too_many_arguments)]
 fn build_center_pane(
     root_model: &ListStore,
     is_dark: bool,
     expand_headers: bool,
     meta_toggle: &ToggleButton,
     compact: bool,
+    select_toggle: &ToggleButton,
+    select_mode: &Rc<SelectMode>,
+    refresh_bulk_ui: &Rc<dyn Fn()>,
 ) -> (
     Box,
     SingleSelection,
@@ -1827,8 +2044,14 @@ fn build_center_pane(
     vbox.append(&search);
 
     // ── Thread list ──────────────────────────────────────────
-    let (thread_view, selection, expand_guard) =
-        build_thread_list(root_model, meta_toggle, compact);
+    let (thread_view, selection, expand_guard) = build_thread_list(
+        root_model,
+        meta_toggle,
+        compact,
+        select_toggle,
+        select_mode,
+        refresh_bulk_ui,
+    );
 
     let scrolled = ScrolledWindow::new();
     scrolled.set_vexpand(true);
@@ -1934,6 +2157,9 @@ fn build_thread_list(
     root_model: &ListStore,
     meta_toggle: &ToggleButton,
     compact: bool,
+    select_toggle: &ToggleButton,
+    select_mode: &Rc<SelectMode>,
+    refresh_bulk_ui: &Rc<dyn Fn()>,
 ) -> (ListView, SingleSelection, Rc<Cell<bool>>) {
     // True during a programmatic recursive expansion, so the per-row
     // `expanded` notify handlers do not launch nested sweeps.
@@ -1953,6 +2179,20 @@ fn build_thread_list(
     factory.connect_setup(move |_, obj| {
         let list_item = obj.downcast_ref::<ListItem>().unwrap();
         let expander = TreeExpander::new();
+
+        // Row content: an optional select-mode checkbox beside the text column.
+        // The checkbox lives inside the row's own content (never the parent
+        // GtkListItemWidget), so the tint/manager reentrancy rule is preserved.
+        let row_box = Box::new(Orientation::Horizontal, 6);
+        row_box.set_hexpand(true);
+
+        // Select-mode checkbox. Only top-level rows show it (bind wires its
+        // visibility to the header toggle and its `toggled` handler); child
+        // rows keep it hidden, so the binding cannot be set up uniformly here.
+        let check = gtk4::CheckButton::new();
+        check.set_valign(Align::Center);
+        check.set_visible(false);
+        row_box.append(&check);
 
         let vbox = Box::new(Orientation::Vertical, row_pad);
         vbox.set_hexpand(true);
@@ -1988,18 +2228,30 @@ fn build_thread_list(
             .build();
         vbox.append(&meta);
 
-        expander.set_child(Some(&vbox));
+        row_box.append(&vbox);
+        expander.set_child(Some(&row_box));
         list_item.set_child(Some(&expander));
     });
 
     let guard_for_bind = expand_guard.clone();
+    let select_mode_bind = select_mode.clone();
+    let refresh_bulk_bind = refresh_bulk_ui.clone();
+    let select_toggle_bind = select_toggle.clone();
     factory.connect_bind(move |_, obj| {
         let list_item = obj.downcast_ref::<ListItem>().unwrap();
         let row = list_item.item().and_downcast::<TreeListRow>().unwrap();
         let expander = list_item.child().and_downcast::<TreeExpander>().unwrap();
         expander.set_list_row(Some(&row));
+        let row_box = expander.child().and_downcast::<Box>();
+        let check = row_box
+            .as_ref()
+            .and_then(|b| b.first_child())
+            .and_downcast::<gtk4::CheckButton>();
         if let Some(node) = row.item().and_downcast::<ThreadNode>() {
-            if let Some(vbox) = expander.child().and_downcast::<Box>()
+            if let Some(vbox) = check
+                .as_ref()
+                .and_then(|c| c.next_sibling())
+                .and_downcast::<Box>()
                 && let Some(subject) = vbox.first_child().and_downcast::<Label>()
             {
                 subject.set_label(&node.subject());
@@ -2013,6 +2265,27 @@ fn build_thread_list(
             // owns, and mutating that from inside bind reenters the manager
             // mid-update and corrupts it.
             install_tint(list_item, &node, &expander);
+
+            // Only top-level rows get an interactive checkbox. Children keep it
+            // hidden regardless of the header toggle. The checkbox lives in the
+            // row's own box, so it never touches the list-item widget.
+            if let Some(check) = check {
+                if row.parent().is_none() {
+                    install_check(
+                        list_item,
+                        &check,
+                        &node,
+                        &select_toggle_bind,
+                        &select_mode_bind,
+                        &refresh_bulk_bind,
+                    );
+                } else {
+                    // Recycled child row: clear any stale handler and hide it.
+                    remove_check(list_item);
+                    check.set_active(false);
+                    check.set_visible(false);
+                }
+            }
         }
         // Make a manual arrow/keyboard expansion go full-depth too.
         install_expand(list_item, &row, &guard_for_bind);
@@ -2021,6 +2294,7 @@ fn build_thread_list(
         let list_item = obj.downcast_ref::<ListItem>().unwrap();
         remove_tint(list_item);
         remove_expand(list_item);
+        remove_check(list_item);
     });
 
     // ── Model pipeline: SortListModel → TreeListModel → Selection ──
@@ -2085,6 +2359,9 @@ const THREAD_TINT_CLASS: &str = "thread-active";
 const TINT_HANDLER_KEY: &str = "lb-tint-handler";
 /// `list_item` data key holding the `expanded` notify handler and its row.
 const EXPAND_HANDLER_KEY: &str = "lb-expand-handler";
+/// `list_item` data key holding the select-mode checkbox `toggled` handler,
+/// the checkbox it lives on, and the visibility binding to the header toggle.
+const CHECK_HANDLER_KEY: &str = "lb-check-handler";
 
 /// Top-level row of the thread containing `row`.
 fn root_row_of(row: &TreeListRow) -> TreeListRow {
@@ -2201,6 +2478,87 @@ fn remove_expand(list_item: &ListItem) {
             list_item.steal_data::<(TreeListRow, glib::SignalHandlerId)>(EXPAND_HANDLER_KEY)
         {
             row.disconnect(handler);
+        }
+    }
+}
+
+/// Wire a top-level row's select-mode checkbox: bind its visibility to the
+/// header toggle, seed `active` from the node's `checked`, and connect
+/// `toggled` to update the node, the `picked` set, and the action-bar labels.
+/// The handler is stashed like `install_tint` so a recycled row disconnects it
+/// (otherwise it would fire on the wrong node). Ids are collected at check time
+/// so the bulk action needs no live node reference afterwards.
+fn install_check(
+    list_item: &ListItem,
+    check: &gtk4::CheckButton,
+    node: &ThreadNode,
+    select_toggle: &ToggleButton,
+    select_mode: &Rc<SelectMode>,
+    refresh_bulk_ui: &Rc<dyn Fn()>,
+) {
+    remove_check(list_item);
+
+    let binding = select_toggle
+        .bind_property("active", check, "visible")
+        .sync_create()
+        .build();
+
+    // Seed from the node's checked flag while suppressing the toggled handler
+    // (the programmatic set_active below would otherwise miscount the set).
+    let syncing = Rc::new(Cell::new(true));
+    check.set_active(node.checked());
+
+    let node_c = node.clone();
+    let root_mid = node.message_id();
+    let sel_mode = select_mode.clone();
+    let refresh = refresh_bulk_ui.clone();
+    let syncing_h = syncing.clone();
+    let handler = check.connect_toggled(move |c| {
+        if syncing_h.get() {
+            return;
+        }
+        let active = c.is_active();
+        node_c.set_checked(active);
+        {
+            let mut picked = sel_mode.picked.borrow_mut();
+            if active {
+                let mut ids = Vec::new();
+                collect_thread_message_ids(&node_c, &mut ids);
+                picked.insert(
+                    root_mid.clone(),
+                    PickedThread {
+                        subject: node_c.subject(),
+                        ids,
+                    },
+                );
+            } else {
+                picked.remove(&root_mid);
+            }
+        }
+        refresh();
+    });
+    syncing.set(false);
+
+    // SAFETY: list items are accessed only on the GTK main thread, and this
+    // key is always paired with this value type.
+    unsafe {
+        list_item.set_data(
+            CHECK_HANDLER_KEY,
+            (check.clone(), handler, binding),
+        );
+    }
+}
+
+fn remove_check(list_item: &ListItem) {
+    // SAFETY: see install_check; same key and value type.
+    unsafe {
+        if let Some((check, handler, binding)) = list_item
+            .steal_data::<(gtk4::CheckButton, glib::SignalHandlerId, glib::Binding)>(
+                CHECK_HANDLER_KEY,
+            )
+        {
+            check.disconnect(handler);
+            binding.unbind();
         }
     }
 }

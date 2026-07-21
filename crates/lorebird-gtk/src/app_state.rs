@@ -230,8 +230,6 @@ impl AppState {
     /// mapped to its series key; entries whose key and ids are both empty are
     /// skipped. Returns the total newly archived count. Callers run a single
     /// [`rerun_active_view`](Self::rerun_active_view) afterwards.
-    // Wired to the multi-select bulk action UI in a follow-up commit.
-    #[allow(dead_code)]
     pub fn archive_series_bulk(
         &self,
         items: &[(String, Vec<String>)],
@@ -247,7 +245,6 @@ impl AppState {
 
     /// Unarchive many threads' series in one DB transaction. Symmetric to
     /// [`archive_series_bulk`](Self::archive_series_bulk).
-    #[allow(dead_code)]
     pub fn unarchive_series_bulk(
         &self,
         items: &[(String, Vec<String>)],
@@ -531,7 +528,6 @@ impl AppState {
 
 /// Map each `(subject, ids)` to `(series_key, ids)`, dropping entries whose
 /// key and ids are both empty (nothing to act on).
-#[allow(dead_code)]
 fn prepare_bulk_items(items: &[(String, Vec<String>)]) -> Vec<(String, Vec<String>)> {
     items
         .iter()
