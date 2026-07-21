@@ -219,6 +219,8 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     bulk_archive_btn.add_css_class("flat");
     let bulk_unarchive_btn = gtk4::Button::with_label("Unarchive selected (0)");
     bulk_unarchive_btn.add_css_class("flat");
+    let bulk_follow_btn = gtk4::Button::with_label("Follow selected (0)");
+    bulk_follow_btn.add_css_class("flat");
     let bulk_clear_btn = gtk4::Button::with_label("Clear");
     bulk_clear_btn.add_css_class("flat");
     let bulk_bar = Box::new(Orientation::Horizontal, 6);
@@ -228,6 +230,7 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     bulk_bar.set_margin_end(8);
     bulk_bar.append(&bulk_archive_btn);
     bulk_bar.append(&bulk_unarchive_btn);
+    bulk_bar.append(&bulk_follow_btn);
     bulk_bar.append(&bulk_clear_btn);
     let bulk_revealer = gtk4::Revealer::new();
     bulk_revealer.set_child(Some(&bulk_bar));
@@ -238,13 +241,16 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
         let select_mode = select_mode.clone();
         let archive_btn = bulk_archive_btn.clone();
         let unarchive_btn = bulk_unarchive_btn.clone();
+        let follow_btn = bulk_follow_btn.clone();
         Rc::new(move || {
             let n = select_mode.picked.borrow().len();
             archive_btn.set_label(&format!("Archive selected ({n})"));
             unarchive_btn.set_label(&format!("Unarchive selected ({n})"));
+            follow_btn.set_label(&format!("Follow selected ({n})"));
             let any = n > 0;
             archive_btn.set_sensitive(any);
             unarchive_btn.set_sensitive(any);
+            follow_btn.set_sensitive(any);
         })
     };
     refresh_bulk_ui();
@@ -868,6 +874,12 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     unarchive_selected_btn.set_margin_bottom(4);
     unarchive_selected_btn.set_margin_start(8);
     unarchive_selected_btn.set_margin_end(8);
+    let follow_selected_btn = gtk4::Button::with_label("Follow selected series");
+    follow_selected_btn.add_css_class("flat");
+    follow_selected_btn.set_margin_top(4);
+    follow_selected_btn.set_margin_bottom(4);
+    follow_selected_btn.set_margin_start(8);
+    follow_selected_btn.set_margin_end(8);
     let archive_separator = gtk4::Separator::new(Orientation::Horizontal);
     menu_box.append(&reply_menu_btn);
     menu_box.append(&edit_draft_btn);
@@ -878,6 +890,7 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     menu_box.append(&unarchive_menu_btn);
     menu_box.append(&archive_selected_btn);
     menu_box.append(&unarchive_selected_btn);
+    menu_box.append(&follow_selected_btn);
     context_menu.set_child(Some(&menu_box));
 
     let state_for_ctx = state.clone();
@@ -1082,6 +1095,57 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
         })
     };
 
+    // ── Bulk follow of the multi-selected threads' series ──────────
+    // Follows each picked thread's series with default settings (no per-thread
+    // dialog, not added to any inbox), deriving the series key from the subject.
+    // Empty keys and already-followed queries are skipped; the sidebar is
+    // refreshed once afterwards. Like bulk archive, it clears the set and exits
+    // select mode.
+    let run_bulk_follow: Rc<dyn Fn()> = {
+        let state = state.clone();
+        let select_mode = select_mode.clone();
+        let select_toggle = select_toggle.clone();
+        let status = status_label.clone();
+        let sidebar_model = sidebar_model_for_follow.clone();
+        let default_profile = default_profile.clone();
+        Rc::new(move || {
+            let subjects: Vec<String> = select_mode
+                .picked
+                .borrow()
+                .values()
+                .map(|p| p.subject.clone())
+                .collect();
+            if subjects.is_empty() {
+                status.set_text("Select one or more threads first");
+                return;
+            }
+            let n_threads = subjects.len();
+            let s = state.borrow();
+            let mut new_count = 0usize;
+            for subject in &subjects {
+                let key = lorebird_core::series::series_key(subject);
+                if key.is_empty() {
+                    continue;
+                }
+                let query = format!("subject:\"{}\"", key.replace('"', ""));
+                if s.is_followed(&query) {
+                    continue;
+                }
+                s.add_follow(Follow {
+                    label: key,
+                    query,
+                    in_inbox: false,
+                });
+                new_count += 1;
+            }
+            refresh_follow_rows(&sidebar_model, &default_profile, &s.follows.borrow());
+            drop(s);
+            status.set_text(&format!("Following {n_threads} series ({new_count} new)"));
+            select_mode.picked.borrow_mut().clear();
+            select_toggle.set_active(false);
+        })
+    };
+
     // Select-mode toggle: reveal the action bar, or on turning off clear the
     // picked set and untick every live top-level node so checkboxes reset.
     let select_mode_toggle = select_mode.clone();
@@ -1108,6 +1172,8 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     bulk_archive_btn.connect_clicked(move |_| run_bulk_archive(true));
     let run_bulk_unarchive = run_bulk.clone();
     bulk_unarchive_btn.connect_clicked(move |_| run_bulk_unarchive(false));
+    let run_bulk_follow_btn = run_bulk_follow.clone();
+    bulk_follow_btn.connect_clicked(move |_| run_bulk_follow_btn());
 
     let select_mode_clear = select_mode.clone();
     let root_model_for_clear = state_ref.root_model.clone();
@@ -1134,6 +1200,12 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
         ctx_menu_unarchive_sel.popdown();
         run_bulk_unarchive_menu(false);
     });
+    let run_bulk_follow_menu = run_bulk_follow.clone();
+    let ctx_menu_follow_sel = context_menu.clone();
+    follow_selected_btn.connect_clicked(move |_| {
+        ctx_menu_follow_sel.popdown();
+        run_bulk_follow_menu();
+    });
 
     // Right-click gesture on the column view
     let ctx_menu_ref = context_menu.clone();
@@ -1146,6 +1218,7 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     let unarchive_menu_btn_gesture = unarchive_menu_btn.clone();
     let archive_selected_gesture = archive_selected_btn.clone();
     let unarchive_selected_gesture = unarchive_selected_btn.clone();
+    let follow_selected_gesture = follow_selected_btn.clone();
     let archive_sep_gesture = archive_separator.clone();
     let gesture = gtk4::GestureClick::new();
     gesture.set_button(gtk4::gdk::BUTTON_SECONDARY);
@@ -1172,6 +1245,7 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
                 unarchive_menu_btn_gesture.set_visible(false);
                 archive_selected_gesture.set_visible(false);
                 unarchive_selected_gesture.set_visible(false);
+                follow_selected_gesture.set_visible(false);
             }
             _ => {
                 reply_menu_btn_gesture.set_visible(true);
@@ -1187,8 +1261,10 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
                 let any = !select_mode_gesture.picked.borrow().is_empty();
                 archive_selected_gesture.set_visible(on);
                 unarchive_selected_gesture.set_visible(on);
+                follow_selected_gesture.set_visible(on);
                 archive_selected_gesture.set_sensitive(any);
                 unarchive_selected_gesture.set_sensitive(any);
+                follow_selected_gesture.set_sensitive(any);
             }
         }
 
