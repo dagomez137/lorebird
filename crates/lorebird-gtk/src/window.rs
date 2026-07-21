@@ -54,6 +54,11 @@ struct SelectMode {
     /// those writes would re-enter the `toggled` handler; the flag makes it a
     /// no-op there and leaves the picked set and anchor authoritative.
     in_bulk_update: Cell<bool>,
+    /// Whether the primary press that is about to fire a `toggled` held Shift.
+    /// A capture-phase gesture records it before the built-in toggle runs; the
+    /// `toggled` handler then reconciles with the toggle instead of fighting it,
+    /// filling a range rather than flipping this one box.
+    shift_pending: Cell<bool>,
 }
 
 // ── Public entry point ─────────────────────────────────────────────
@@ -216,6 +221,7 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
         picked: RefCell::new(HashMap::new()),
         anchor: Cell::new(None),
         in_bulk_update: Cell::new(false),
+        shift_pending: Cell::new(false),
     });
     // A text label rather than an icon: this theme only carries the bundled
     // custom symbolics, so a stock checkbox icon renders blank.
@@ -1088,6 +1094,8 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
                     let verb = if archive { "Archived" } else { "Unarchived" };
                     status.set_text(&format!("{verb} {n_threads} thread(s), {n} message(s)"));
                     select_mode.picked.borrow_mut().clear();
+                    select_mode.anchor.set(None);
+                    select_mode.shift_pending.set(false);
                     // Exit select mode so the rebuilt rows come up unchecked;
                     // this also hides the checkboxes and the action bar.
                     select_toggle.set_active(false);
@@ -1153,6 +1161,8 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
             drop(s);
             status.set_text(&format!("Following {n_threads} series ({new_count} new)"));
             select_mode.picked.borrow_mut().clear();
+            select_mode.anchor.set(None);
+            select_mode.shift_pending.set(false);
             select_toggle.set_active(false);
         })
     };
@@ -1169,6 +1179,8 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
         bulk_revealer_toggle.set_reveal_child(on);
         if !on {
             select_mode_toggle.picked.borrow_mut().clear();
+            select_mode_toggle.anchor.set(None);
+            select_mode_toggle.shift_pending.set(false);
             for i in 0..root_model_for_toggle.n_items() {
                 if let Some(node) = root_model_for_toggle.item(i).and_downcast::<ThreadNode>() {
                     node.set_checked(false);
@@ -1191,6 +1203,8 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     let refresh_bulk_clear = refresh_bulk_ui.clone();
     bulk_clear_btn.connect_clicked(move |_| {
         select_mode_clear.picked.borrow_mut().clear();
+        select_mode_clear.anchor.set(None);
+        select_mode_clear.shift_pending.set(false);
         for i in 0..root_model_for_clear.n_items() {
             if let Some(node) = root_model_for_clear.item(i).and_downcast::<ThreadNode>() {
                 node.set_checked(false);
@@ -2640,12 +2654,13 @@ fn fill_range(model: &gio::ListModel, select_mode: &SelectMode, anchor: u32, pos
 /// Wire a top-level row's select-mode checkbox: bind its visibility to the
 /// header toggle, seed `active` from the node's `checked`, and connect
 /// `toggled` to update the node, the `picked` set, and the action-bar labels.
-/// A Shift+click capture gesture on the checkbox fills a contiguous range from
-/// the anchor thread instead of toggling just this one; a plain check records
-/// this row as the new anchor. The handler and gesture are stashed like
-/// `install_tint` so a recycled row disconnects them (otherwise they would fire
-/// on the wrong node). Ids are collected at check time so the bulk action needs
-/// no live node reference afterwards.
+/// A capture-phase gesture records whether Shift was held on the press; the
+/// `toggled` handler then either fills a contiguous range from the standing
+/// anchor (Shift) or toggles just this one row and records it as the new anchor
+/// (plain). The handler and gesture are stashed like `install_tint` so a
+/// recycled row disconnects them (otherwise they would fire on the wrong node).
+/// Ids are collected at check time so the bulk action needs no live node
+/// reference afterwards.
 fn install_check(
     list_item: &ListItem,
     check: &gtk4::CheckButton,
@@ -2686,6 +2701,25 @@ fn install_check(
         if syncing_h.get() || sel_mode.in_bulk_update.get() {
             return;
         }
+        let Some(model) = thread_list_model(&check_for_anchor) else {
+            return;
+        };
+        let Some(pos) = top_level_position(&model, &node_c) else {
+            return;
+        };
+        // A Shift+click extends a range from the standing anchor. The built-in
+        // toggle has already flipped this one box either way, so fill_range
+        // forces the whole inclusive span (this row included) back to checked,
+        // reconciling with the toggle instead of trying to suppress it. The
+        // anchor is left unchanged so repeated Shift+clicks keep extending from
+        // the same origin.
+        if sel_mode.shift_pending.get() {
+            sel_mode.shift_pending.set(false);
+            let anchor = sel_mode.anchor.get().unwrap_or(pos);
+            fill_range(&model, &sel_mode, anchor, pos);
+            refresh();
+            return;
+        }
         let active = c.is_active();
         if active {
             check_node_into_picked(&sel_mode, &node_c);
@@ -2695,27 +2729,19 @@ fn install_check(
         }
         // A plain check becomes the anchor for a later Shift+click range; an
         // uncheck clears it so the next Shift+click starts a fresh anchor.
-        if active {
-            sel_mode
-                .anchor
-                .set(thread_list_model(&check_for_anchor).and_then(|m| top_level_position(&m, &node_c)));
-        } else {
-            sel_mode.anchor.set(None);
-        }
+        sel_mode.anchor.set(if active { Some(pos) } else { None });
         refresh();
     });
     syncing.set(false);
 
-    // Shift+click range fill. Runs in the capture phase before the built-in
-    // toggle so a range select never also flips this one box out of step; the
-    // gesture claims the event and checks the whole span (this row included).
+    // Capture-phase gesture that only records whether Shift was held on this
+    // primary press, before the built-in toggle runs. The `toggled` handler
+    // reads it to decide between a range fill and a plain toggle; the gesture
+    // does not consume the event, so the CheckButton toggles normally.
     let gesture = gtk4::GestureClick::new();
     gesture.set_button(gtk4::gdk::BUTTON_PRIMARY);
     gesture.set_propagation_phase(gtk4::PropagationPhase::Capture);
-    let node_g = node.clone();
     let sel_mode_g = select_mode.clone();
-    let refresh_g = refresh_bulk_ui.clone();
-    let check_g = check.clone();
     gesture.connect_pressed(move |g, _n, _x, _y| {
         if !sel_mode_g.on.get() {
             return;
@@ -2723,25 +2749,7 @@ fn install_check(
         let shift = g
             .current_event_state()
             .contains(gtk4::gdk::ModifierType::SHIFT_MASK);
-        if !shift {
-            return;
-        }
-        let Some(model) = thread_list_model(&check_g) else {
-            return;
-        };
-        let Some(pos) = top_level_position(&model, &node_g) else {
-            return;
-        };
-        // With no prior anchor a Shift+click behaves like a plain check of this
-        // row; either way this row ends up checked and becomes the new anchor.
-        // Each realised checkbox mirrors its node's `checked` via a property
-        // binding, so setting the nodes updates the visible ticks directly.
-        let anchor = sel_mode_g.anchor.get().unwrap_or(pos);
-        fill_range(&model, &sel_mode_g, anchor, pos);
-        sel_mode_g.anchor.set(Some(pos));
-        refresh_g();
-        // Claim the event so the default toggle does not also fire on this box.
-        g.set_state(gtk4::EventSequenceState::Claimed);
+        sel_mode_g.shift_pending.set(shift);
     });
     check.add_controller(gesture.clone());
 
