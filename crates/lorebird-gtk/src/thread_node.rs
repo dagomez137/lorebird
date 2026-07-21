@@ -48,6 +48,11 @@ mod imp {
         /// the whole-thread tint.
         #[property(get, set)]
         in_selected_thread: Cell<bool>,
+        /// Set while this top-level thread is ticked in select mode; drives the
+        /// bulk-action set and the row checkbox. Independent of the single
+        /// selection that drives preview and tint.
+        #[property(get, set)]
+        checked: Cell<bool>,
         #[property(get, set)]
         body_preview: RefCell<String>,
         /// The Message-ID header of this message (for In-Reply-To).
