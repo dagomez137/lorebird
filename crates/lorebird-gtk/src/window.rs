@@ -206,8 +206,9 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
         on: Cell::new(false),
         picked: RefCell::new(HashMap::new()),
     });
-    let select_toggle = ToggleButton::new();
-    select_toggle.set_icon_name("checkbox-checked-symbolic");
+    // A text label rather than an icon: this theme only carries the bundled
+    // custom symbolics, so a stock checkbox icon renders blank.
+    let select_toggle = ToggleButton::with_label("Select");
     select_toggle.set_tooltip_text(Some("Select multiple threads for bulk actions"));
     select_toggle.add_css_class("flat");
     header.pack_start(&select_toggle);
