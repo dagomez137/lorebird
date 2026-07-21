@@ -58,6 +58,52 @@ pub fn unarchive_message_ids(conn: &Connection, ids: &[String]) -> SqlResult<usi
     Ok(n)
 }
 
+/// Archive several series at once inside a single transaction.
+///
+/// For each `(series_key, ids)` pair this unions the subject-key match
+/// ([`archive_series`]) with the explicit ids ([`archive_message_ids`]), so a
+/// bulk selection is atomic and touches the DB once. An empty `series_key`
+/// skips the subject match and an empty `ids` skips the id insert. Returns the
+/// total number of newly archived messages.
+pub fn archive_series_bulk(
+    conn: &mut Connection,
+    items: &[(String, Vec<String>)],
+) -> SqlResult<usize> {
+    let tx = conn.transaction()?;
+    let mut n = 0;
+    for (key, ids) in items {
+        if !key.is_empty() {
+            n += archive_series(&tx, key)?;
+        }
+        if !ids.is_empty() {
+            n += archive_message_ids(&tx, ids)?;
+        }
+    }
+    tx.commit()?;
+    Ok(n)
+}
+
+/// Unarchive several series at once inside a single transaction.
+///
+/// Symmetric to [`archive_series_bulk`]. Returns the total number removed.
+pub fn unarchive_series_bulk(
+    conn: &mut Connection,
+    items: &[(String, Vec<String>)],
+) -> SqlResult<usize> {
+    let tx = conn.transaction()?;
+    let mut n = 0;
+    for (key, ids) in items {
+        if !key.is_empty() {
+            n += unarchive_series(&tx, key)?;
+        }
+        if !ids.is_empty() {
+            n += unarchive_message_ids(&tx, ids)?;
+        }
+    }
+    tx.commit()?;
+    Ok(n)
+}
+
 /// Load the full set of archived message ids.
 ///
 /// The `archived` table is small (only explicitly archived series), so the
@@ -136,6 +182,45 @@ mod tests {
 
         let removed = unarchive_message_ids(&conn, &ids).unwrap();
         assert_eq!(removed, 3);
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM archived", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn archive_and_unarchive_series_bulk() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        schema::init_db(&conn).unwrap();
+
+        seed(&conn, "a@x", "[GIT PULL] nvme updates for Linux 7.2");
+        seed(&conn, "b@x", "Re: [GIT PULL] nvme updates for Linux 7.1");
+        seed(&conn, "c@x", "[PATCH 0/2] scsi cleanups");
+        seed(&conn, "d@x", "[PATCH 1/2] scsi cleanups: first");
+        seed(&conn, "e@x", "[PATCH 2/2] scsi cleanups: second");
+
+        // First item archives by subject key; second item adds patch siblings
+        // whose subjects differ from the key via explicit thread ids.
+        let items = vec![
+            ("nvme updates for Linux".to_string(), vec![]),
+            (
+                "scsi cleanups".to_string(),
+                vec!["c@x".to_string(), "d@x".to_string(), "e@x".to_string()],
+            ),
+        ];
+        let n = archive_series_bulk(&mut conn, &items).unwrap();
+        assert_eq!(n, 5);
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM archived", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 5);
+
+        // Re-running is idempotent.
+        assert_eq!(archive_series_bulk(&mut conn, &items).unwrap(), 0);
+
+        let removed = unarchive_series_bulk(&mut conn, &items).unwrap();
+        assert_eq!(removed, 5);
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM archived", [], |r| r.get(0))
             .unwrap();
