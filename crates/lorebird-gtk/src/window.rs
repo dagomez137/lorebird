@@ -45,6 +45,15 @@ struct PickedThread {
 struct SelectMode {
     on: Cell<bool>,
     picked: RefCell<HashMap<String, PickedThread>>,
+    /// Tree-model position of the last plainly-checked top-level row, the anchor
+    /// for a subsequent Shift+click range. Captured at click time and consumed
+    /// synchronously, so a later accordion reshuffle cannot stale it.
+    anchor: Cell<Option<u32>>,
+    /// Raised while a range fill drives node `checked` flags programmatically.
+    /// Each checkbox mirrors its node's `checked` through a property binding, so
+    /// those writes would re-enter the `toggled` handler; the flag makes it a
+    /// no-op there and leaves the picked set and anchor authoritative.
+    in_bulk_update: Cell<bool>,
 }
 
 // ── Public entry point ─────────────────────────────────────────────
@@ -205,6 +214,8 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     let select_mode = Rc::new(SelectMode {
         on: Cell::new(false),
         picked: RefCell::new(HashMap::new()),
+        anchor: Cell::new(None),
+        in_bulk_update: Cell::new(false),
     });
     // A text label rather than an icon: this theme only carries the bundled
     // custom symbolics, so a stock checkbox icon renders blank.
@@ -2559,12 +2570,82 @@ fn remove_expand(list_item: &ListItem) {
     }
 }
 
+/// Tick `node` into the picked set: flag it checked and record its subject and
+/// whole-thread ids, keyed on the root message-id. Shared by the checkbox
+/// `toggled` handler and the Shift+click range fill.
+fn check_node_into_picked(select_mode: &SelectMode, node: &ThreadNode) {
+    node.set_checked(true);
+    let mut ids = Vec::new();
+    collect_thread_message_ids(node, &mut ids);
+    select_mode.picked.borrow_mut().insert(
+        node.message_id(),
+        PickedThread {
+            subject: node.subject(),
+            ids,
+        },
+    );
+}
+
+/// The list model whose items are the currently-expanded `TreeListRow`s, found
+/// by walking up from a row widget to the enclosing `ListView`.
+fn thread_list_model(widget: &impl IsA<gtk4::Widget>) -> Option<gio::ListModel> {
+    widget
+        .ancestor(ListView::static_type())
+        .and_downcast::<ListView>()
+        .and_then(|lv| lv.model())
+        .map(|m| m.upcast::<gio::ListModel>())
+}
+
+/// Position of the top-level row backing `node` in `model`, matched by the
+/// persistent node identity. Positions index the flattened, expanded rows.
+fn top_level_position(model: &gio::ListModel, node: &ThreadNode) -> Option<u32> {
+    for i in 0..model.n_items() {
+        let Some(row) = model.item(i).and_downcast::<TreeListRow>() else {
+            continue;
+        };
+        if row.parent().is_some() {
+            continue;
+        }
+        if let Some(item) = row.item().and_downcast::<ThreadNode>()
+            && item.message_id() == node.message_id()
+        {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Check every top-level thread between the anchor position and `pos`
+/// (inclusive) into the picked set, syncing each realised checkbox. Non-top
+/// rows in the flattened range are skipped.
+fn fill_range(model: &gio::ListModel, select_mode: &SelectMode, anchor: u32, pos: u32) {
+    let (lo, hi) = (anchor.min(pos), anchor.max(pos));
+    // The node `checked` writes below drive each realised checkbox through its
+    // binding, which re-enters `toggled`; the guard neutralises that there.
+    select_mode.in_bulk_update.set(true);
+    for i in lo..=hi {
+        let Some(row) = model.item(i).and_downcast::<TreeListRow>() else {
+            continue;
+        };
+        if row.parent().is_some() {
+            continue;
+        }
+        if let Some(node) = row.item().and_downcast::<ThreadNode>() {
+            check_node_into_picked(select_mode, &node);
+        }
+    }
+    select_mode.in_bulk_update.set(false);
+}
+
 /// Wire a top-level row's select-mode checkbox: bind its visibility to the
 /// header toggle, seed `active` from the node's `checked`, and connect
 /// `toggled` to update the node, the `picked` set, and the action-bar labels.
-/// The handler is stashed like `install_tint` so a recycled row disconnects it
-/// (otherwise it would fire on the wrong node). Ids are collected at check time
-/// so the bulk action needs no live node reference afterwards.
+/// A Shift+click capture gesture on the checkbox fills a contiguous range from
+/// the anchor thread instead of toggling just this one; a plain check records
+/// this row as the new anchor. The handler and gesture are stashed like
+/// `install_tint` so a recycled row disconnects them (otherwise they would fire
+/// on the wrong node). Ids are collected at check time so the bulk action needs
+/// no live node reference afterwards.
 fn install_check(
     list_item: &ListItem,
     check: &gtk4::CheckButton,
@@ -2585,43 +2666,91 @@ fn install_check(
     let syncing = Rc::new(Cell::new(true));
     check.set_active(node.checked());
 
+    // Mirror the node's `checked` onto the box so a range fill (which writes the
+    // nodes) updates every realised tick without touching row widgets. One-way:
+    // user clicks still flow through `toggled`, which writes the node back.
+    let checked_binding = node
+        .bind_property("checked", check, "active")
+        .sync_create()
+        .build();
+
     let node_c = node.clone();
     let root_mid = node.message_id();
     let sel_mode = select_mode.clone();
     let refresh = refresh_bulk_ui.clone();
     let syncing_h = syncing.clone();
+    let check_for_anchor = check.clone();
     let handler = check.connect_toggled(move |c| {
-        if syncing_h.get() {
+        // Skip the initial seed and any binding-driven update during a range
+        // fill: the fill already owns the picked set and the anchor.
+        if syncing_h.get() || sel_mode.in_bulk_update.get() {
             return;
         }
         let active = c.is_active();
-        node_c.set_checked(active);
-        {
-            let mut picked = sel_mode.picked.borrow_mut();
-            if active {
-                let mut ids = Vec::new();
-                collect_thread_message_ids(&node_c, &mut ids);
-                picked.insert(
-                    root_mid.clone(),
-                    PickedThread {
-                        subject: node_c.subject(),
-                        ids,
-                    },
-                );
-            } else {
-                picked.remove(&root_mid);
-            }
+        if active {
+            check_node_into_picked(&sel_mode, &node_c);
+        } else {
+            node_c.set_checked(false);
+            sel_mode.picked.borrow_mut().remove(&root_mid);
+        }
+        // A plain check becomes the anchor for a later Shift+click range; an
+        // uncheck clears it so the next Shift+click starts a fresh anchor.
+        if active {
+            sel_mode
+                .anchor
+                .set(thread_list_model(&check_for_anchor).and_then(|m| top_level_position(&m, &node_c)));
+        } else {
+            sel_mode.anchor.set(None);
         }
         refresh();
     });
     syncing.set(false);
+
+    // Shift+click range fill. Runs in the capture phase before the built-in
+    // toggle so a range select never also flips this one box out of step; the
+    // gesture claims the event and checks the whole span (this row included).
+    let gesture = gtk4::GestureClick::new();
+    gesture.set_button(gtk4::gdk::BUTTON_PRIMARY);
+    gesture.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    let node_g = node.clone();
+    let sel_mode_g = select_mode.clone();
+    let refresh_g = refresh_bulk_ui.clone();
+    let check_g = check.clone();
+    gesture.connect_pressed(move |g, _n, _x, _y| {
+        if !sel_mode_g.on.get() {
+            return;
+        }
+        let shift = g
+            .current_event_state()
+            .contains(gtk4::gdk::ModifierType::SHIFT_MASK);
+        if !shift {
+            return;
+        }
+        let Some(model) = thread_list_model(&check_g) else {
+            return;
+        };
+        let Some(pos) = top_level_position(&model, &node_g) else {
+            return;
+        };
+        // With no prior anchor a Shift+click behaves like a plain check of this
+        // row; either way this row ends up checked and becomes the new anchor.
+        // Each realised checkbox mirrors its node's `checked` via a property
+        // binding, so setting the nodes updates the visible ticks directly.
+        let anchor = sel_mode_g.anchor.get().unwrap_or(pos);
+        fill_range(&model, &sel_mode_g, anchor, pos);
+        sel_mode_g.anchor.set(Some(pos));
+        refresh_g();
+        // Claim the event so the default toggle does not also fire on this box.
+        g.set_state(gtk4::EventSequenceState::Claimed);
+    });
+    check.add_controller(gesture.clone());
 
     // SAFETY: list items are accessed only on the GTK main thread, and this
     // key is always paired with this value type.
     unsafe {
         list_item.set_data(
             CHECK_HANDLER_KEY,
-            (check.clone(), handler, binding),
+            (check.clone(), handler, binding, checked_binding, gesture),
         );
     }
 }
@@ -2629,13 +2758,18 @@ fn install_check(
 fn remove_check(list_item: &ListItem) {
     // SAFETY: see install_check; same key and value type.
     unsafe {
-        if let Some((check, handler, binding)) = list_item
-            .steal_data::<(gtk4::CheckButton, glib::SignalHandlerId, glib::Binding)>(
-                CHECK_HANDLER_KEY,
-            )
+        if let Some((check, handler, binding, checked_binding, gesture)) = list_item.steal_data::<(
+            gtk4::CheckButton,
+            glib::SignalHandlerId,
+            glib::Binding,
+            glib::Binding,
+            gtk4::GestureClick,
+        )>(CHECK_HANDLER_KEY)
         {
             check.disconnect(handler);
             binding.unbind();
+            checked_binding.unbind();
+            check.remove_controller(&gesture);
         }
     }
 }
