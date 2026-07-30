@@ -13,10 +13,11 @@ use gio::ListStore;
 use glib::Object;
 use gtk4::prelude::*;
 use gtk4::{
-    Align, Application, ApplicationWindow, Box, CustomSorter, FlowBox, Grid, HeaderBar, IconSize,
-    Image, Label, ListBoxRow, ListItem, ListView, Ordering, Orientation, Paned, PolicyType,
-    ProgressBar, ScrolledWindow, SearchEntry, SignalListItemFactory, SingleSelection, SortListModel,
-    ToggleButton, TreeExpander, TreeListModel, TreeListRow, WrapMode,
+    Align, Application, ApplicationWindow, Box, CustomSorter, DropDown, Expression, FlowBox, Grid,
+    HeaderBar, IconSize, Image, Label, ListBoxRow, ListItem, ListView, Ordering, Orientation, Paned,
+    PolicyType, ProgressBar, PropertyExpression, ScrolledWindow, SearchEntry, SignalListItemFactory,
+    SingleSelection, SortListModel, StringList, StringObject, ToggleButton, TreeExpander,
+    TreeListModel, TreeListRow, WrapMode,
 };
 use lorebird_lua::ContactGroup;
 use sourceview5 as sv;
@@ -303,7 +304,8 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     inner_paned.set_start_child(Some(&center));
     inner_paned.set_shrink_start_child(false);
 
-    let preview = build_preview_pane(&preview_labels);
+    let (preview, body_view) = build_preview_pane(&preview_labels);
+    install_font_switcher(&header, &thread_view, &body_view);
     // The reading pane opens at `reading_pane_columns` of monospace text and
     // can be dragged down to a small floor. Both panes have a hard minimum
     // width with shrink disabled, so neither can be squeezed away and the
@@ -2788,7 +2790,77 @@ fn remove_check(list_item: &ListItem) {
     }
 }
 
-fn build_preview_pane(labels: &PreviewLabels) -> Box {
+/// CSS class the font switcher tags onto the thread list and reading pane.
+const FONT_TEST_CLASS: &str = "lb-font-test";
+
+/// Add a header dropdown that live-swaps the font of the thread list and the
+/// reading pane, so a face can be judged for sharpness against real mail.
+///
+/// This is a visual test aid: the choice is not persisted (once a font is
+/// picked it belongs in `config.lua`). The rule is loaded through a dedicated
+/// provider at USER priority so it overrides the SourceView's built-in
+/// `.monospace` family; `font-family` inherits, so tagging the `ListView` is
+/// enough to reach every row label.
+fn install_font_switcher(header: &HeaderBar, thread_view: &ListView, body_view: &sv::View) {
+    thread_view.add_css_class(FONT_TEST_CLASS);
+    body_view.add_css_class(FONT_TEST_CLASS);
+
+    let provider = gtk4::CssProvider::new();
+    if let Some(display) = gtk4::gdk::Display::default() {
+        gtk4::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk4::STYLE_PROVIDER_PRIORITY_USER,
+        );
+    }
+
+    let mut families: Vec<String> = thread_view
+        .pango_context()
+        .list_families()
+        .iter()
+        .map(|f| f.name().to_string())
+        .collect();
+    families.sort_by_key(|n| n.to_lowercase());
+    families.dedup();
+
+    let refs: Vec<&str> = families.iter().map(String::as_str).collect();
+    let model = StringList::new(&refs);
+    let dropdown = DropDown::new(Some(model), Expression::NONE);
+    dropdown.set_enable_search(true);
+    dropdown.set_expression(Some(PropertyExpression::new(
+        StringObject::static_type(),
+        Expression::NONE,
+        "string",
+    )));
+    dropdown.set_tooltip_text(Some("Test font: thread list and reading pane"));
+
+    // Start on the current monospace face when it is present in the list.
+    if let Some(i) = families.iter().position(|n| n.eq_ignore_ascii_case("Menlo")) {
+        dropdown.set_selected(i as u32);
+    }
+
+    let apply = {
+        let provider = provider.clone();
+        move |family: &str| {
+            provider.load_from_data(&format!(
+                ".{FONT_TEST_CLASS} {{ font-family: \"{}\"; }}",
+                family.replace('"', "")
+            ));
+        }
+    };
+    if let Some(obj) = dropdown.selected_item().and_downcast::<StringObject>() {
+        apply(&obj.string());
+    }
+    dropdown.connect_selected_item_notify(move |dd| {
+        if let Some(obj) = dd.selected_item().and_downcast::<StringObject>() {
+            apply(&obj.string());
+        }
+    });
+
+    header.pack_end(&dropdown);
+}
+
+fn build_preview_pane(labels: &PreviewLabels) -> (Box, sv::View) {
     let vbox = Box::new(Orientation::Vertical, 0);
     vbox.set_margin_top(8);
     vbox.set_margin_bottom(8);
@@ -2897,7 +2969,7 @@ fn build_preview_pane(labels: &PreviewLabels) -> Box {
     scrolled.set_child(Some(&body_view));
     vbox.append(&scrolled);
 
-    vbox
+    (vbox, body_view)
 }
 
 /// Render message body with diff highlighting and prose tagging.
