@@ -158,6 +158,23 @@ impl ParsedQuery {
                 if prefix.eq_ignore_ascii_case("is") {
                     return (String::new(), None);
                 }
+                // `dfn:`/`file:`/`path:` — find a patch by a source path it
+                // touches. A patch diff carries the changed paths on its
+                // `diff --git a/<path> b/<path>` and `+++ b/<path>` lines, all
+                // in the message body, so the path is matched as a body phrase.
+                // FTS5 tokenises `lib/xarray.c` to `lib xarray c`; a phrase
+                // matches those tokens in sequence, which the diff header lines
+                // contain (also matching any mail that quotes the path).
+                if matches!(prefix.to_lowercase().as_str(), "dfn" | "file" | "path") {
+                    // A phrase matches any longer path sharing the same leading
+                    // tokens, so a MAINTAINERS `F:` directory entry (with or
+                    // without a trailing glob) matches every file beneath it.
+                    let path = value.trim_end_matches('*').trim_end_matches('/');
+                    if path.is_empty() {
+                        return (String::new(), None);
+                    }
+                    return (format!("body:\"{}\"", path.replace('"', "\"\"")), None);
+                }
                 let col = map_prefix_to_column(prefix);
                 let term = match col {
                     Some(c) => format!("{}:\"{}\"", c, escaped),
@@ -252,8 +269,10 @@ pub fn matches(query: &Query, msg: &FilterFields) -> bool {
                         || contains_ci(msg.cc, &needle)
                 }
                 "s" | "subject" => contains_ci(msg.subject, &needle),
-                // Body is not cached → can't be satisfied here.
-                "b" | "body" => false,
+                // Body is not cached → can't be satisfied here. `dfn:`/`file:`/
+                // `path:` search the diff, which lives in the body, so they are
+                // in the same boat and route through the FTS path.
+                "b" | "body" | "dfn" | "file" | "path" => false,
                 // `is:` is an archived-state predicate handled separately by
                 // the caller (via ArchivedFilter + the archived id-set), so it
                 // is a no-op for text matching here.
@@ -298,10 +317,13 @@ fn matches_any_text(msg: &FilterFields, needle_lower: &str) -> bool {
 /// FTS [`search`] path to get correct results.
 ///
 /// A bare `Word`/`Phrase` is matched against the cached text fields here, so
-/// it does NOT force the FTS path — only explicit `b:`/`body:` terms do.
+/// it does NOT force the FTS path — only explicit body terms do: `b:`/`body:`
+/// and the diff-path prefixes `dfn:`/`file:`/`path:`, which search the diff.
 pub fn needs_body(query: &Query) -> bool {
     match query {
-        Query::Field { prefix, .. } => matches!(prefix.to_lowercase().as_str(), "b" | "body"),
+        Query::Field { prefix, .. } => {
+            matches!(prefix.to_lowercase().as_str(), "b" | "body" | "dfn" | "file" | "path")
+        }
         Query::And(a, b) | Query::Or(a, b) => needs_body(a) || needs_body(b),
         Query::Not(a) => needs_body(a),
         Query::Phrase(_) | Query::Word(_) | Query::Date(_) => false,
@@ -1001,6 +1023,62 @@ mod tests {
     fn fts5_list_prefix() {
         let q = Query::Field { prefix: "l".into(), value: "linux-nvme.lists.infradead.org".into() };
         assert_eq!(query_to_fts5(&q), "list_id:\"linux-nvme.lists.infradead.org\"");
+    }
+
+    // ── diff-path prefix (dfn:/file:/path:) ────────────────────────
+
+    #[test]
+    fn fts5_dfn_prefix_is_body_phrase() {
+        // Mirrors public-inbox's `dfn:` locally as a body-phrase over the diff.
+        let q = parse_query("dfn:lib/xarray.c").unwrap();
+        assert_eq!(query_to_fts5(&q), "body:\"lib/xarray.c\"");
+        // `file:`/`path:` are aliases.
+        assert_eq!(
+            query_to_fts5(&parse_query("file:include/linux/idr.h").unwrap()),
+            "body:\"include/linux/idr.h\""
+        );
+        assert_eq!(
+            query_to_fts5(&parse_query("path:lib/idr.c").unwrap()),
+            "body:\"lib/idr.c\""
+        );
+    }
+
+    #[test]
+    fn fts5_dfn_strips_trailing_glob() {
+        // A MAINTAINERS `F:` directory entry (trailing `/*` or `/`) becomes the
+        // bare directory; the phrase then matches every path beneath it.
+        assert_eq!(
+            query_to_fts5(&parse_query("dfn:tools/testing/radix-tree/*").unwrap()),
+            "body:\"tools/testing/radix-tree\""
+        );
+        assert_eq!(
+            query_to_fts5(&parse_query("dfn:tools/testing/radix-tree/").unwrap()),
+            "body:\"tools/testing/radix-tree\""
+        );
+    }
+
+    #[test]
+    fn dfn_needs_body_and_is_false_in_memory() {
+        // The diff lives in the body, which the cache does not hold, so a
+        // `dfn:` term must route through the FTS path.
+        let q = parse_query("dfn:lib/xarray.c").unwrap();
+        assert!(needs_body(&q));
+        let (s, f, t, c, l) = sample();
+        let m = fields(&s, &f, &t, &c, &l, 100);
+        assert!(!matches(&q, &m));
+    }
+
+    #[test]
+    fn dfn_composes_with_or_and_date() {
+        // The XArray subsystem shape: OR of diff paths, bounded by a date range.
+        let q = parse_query(
+            "(dfn:lib/xarray.c OR dfn:include/linux/xarray.h) AND date:10y..",
+        )
+        .unwrap();
+        let pq = ParsedQuery::from_ast(&q, 50);
+        assert!(pq.fts5.contains("body:\"lib/xarray.c\""));
+        assert!(pq.fts5.contains("body:\"include/linux/xarray.h\""));
+        assert!(pq.date_range.is_some());
     }
 
     // ── archived state (is:) ──────────────────────────────────────

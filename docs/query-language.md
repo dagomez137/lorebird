@@ -29,12 +29,47 @@ Restrict a search to a specific header or body column:
 | `cc`      |         | `cc`      | `cc:linus@kernel.org`          |
 | `subject` | `s`     | `subject` | `subject:"memory leak"`        |
 | `body`    | `b`     | `body`    | `body:use-after-free`          |
+| `dfn`     | `file`, `path` | `body` (diff) | `dfn:lib/xarray.c`      |
 
 A field value can be quoted if it contains spaces:
 
 ```
 subject:"meeting notes"
 ```
+
+## Diff paths (`dfn:`)
+
+`dfn:` ("diff filename") finds a patch by a source path it touches. It is a
+lore.kernel.org (public-inbox) search prefix: when it appears in a
+`config.lua` fetch window it is sent to lore verbatim and matched against
+lore's indexed diffs. Locally, the same prefix searches the message body as a
+phrase, because a patch diff carries its changed paths on the
+`diff --git a/<path> b/<path>` and `+++ b/<path>` lines, which are indexed in
+the `body` column. Anything that merely quotes the path matches too.
+
+A trailing `/` or glob (`/*`) is stripped, and a phrase matches any longer
+path sharing the same leading path components, so a `MAINTAINERS` `F:`
+directory entry matches every file beneath it:
+
+```
+dfn:lib/xarray.c                 →  patches touching lib/xarray.c
+dfn:tools/testing/radix-tree/*   →  patches under tools/testing/radix-tree/
+```
+
+A whole `MAINTAINERS` entry becomes an `OR` of its `F:` paths, optionally
+bounded by a date range. For the XARRAY subsystem:
+
+```
+(dfn:Documentation/core-api/idr.rst
+ OR dfn:Documentation/core-api/xarray.rst
+ OR dfn:include/linux/idr.h OR dfn:include/linux/xarray.h
+ OR dfn:lib/idr.c OR dfn:lib/test_xarray.c OR dfn:lib/xarray.c
+ OR dfn:tools/testing/radix-tree/*)
+AND date:10y..
+```
+
+Note the local date form is `date:10y..` (see below), not lore's
+`rt:10.years.ago..`.
 
 Unknown prefixes fall back to a full-text search across all columns:
 
