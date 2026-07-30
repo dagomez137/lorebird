@@ -668,6 +668,7 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     let toggle_from = pl.from.scroll.clone();
     let toggle_to = pl.to.scroll.clone();
     let toggle_cc = pl.cc.scroll.clone();
+    let toggle_subject = pl.subject_label.clone();
     let toggle_btn = pl.expand_toggle.clone();
     let state_for_preview = state.clone();
     selection.connect_selection_changed(move |sel, _pos, _n| {
@@ -709,6 +710,7 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
                 || cc_full.len() > HEADER_TRUNCATE_MAX;
             pl.expand_toggle.set_visible(has_long);
             pl.subject_label.set_text(&node.subject());
+            apply_subject_expand(&pl.subject_label, expanded);
             pl.date_label.set_text(&node.last_reply());
             let mid = node.message_id();
             pl.message_id_label
@@ -738,6 +740,7 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
         apply_chip_expand(&toggle_from, expanded);
         apply_chip_expand(&toggle_to, expanded);
         apply_chip_expand(&toggle_cc, expanded);
+        apply_subject_expand(&toggle_subject, expanded);
     });
 
     // ── Track the currently selected node for Reply ────────────
@@ -2175,10 +2178,13 @@ fn build_center_pane(
     let cc = make_chip_field(expand_headers);
     let subject_label = Label::new(Some(""));
     subject_label.set_xalign(0.0);
-    // Wrap with a character fallback so the whole subject shows yet its width
-    // cannot raise the reading pane's minimum and move the divider on switch.
-    subject_label.set_wrap(true);
+    subject_label.set_yalign(0.0);
     subject_label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+    // Collapsed shows one ellipsized line; the expand toggle switches it to full
+    // wrapping (see apply_subject_expand). A small char minimum keeps a long
+    // unbreakable subject from raising the reading pane's minimum width.
+    subject_label.set_width_chars(3);
+    apply_subject_expand(&subject_label, expand_headers);
     let date_label = Label::new(Some(""));
     date_label.set_xalign(0.0);
     // Message-ID is shown bare (no angle brackets) so it pastes straight into
@@ -2791,8 +2797,12 @@ fn build_preview_pane(labels: &PreviewLabels) -> Box {
 
     // ── Headers ──────────────────────────────────────────────
     let headers = Grid::new();
-    headers.set_column_spacing(12);
-    headers.set_row_spacing(4);
+    headers.set_column_spacing(10);
+    // Small, uniform gap between every field, the same collapsed or expanded, so
+    // the fields read as a consistently spaced block rather than one crammed
+    // slab. The per-field height floor is handled separately (see make_chip_field
+    // and the .chip-field CSS), so this stays constant.
+    headers.set_row_spacing(HEADER_ROW_SPACING);
     headers.set_margin_bottom(8);
 
     let add_row = |grid: &Grid, row: i32, key: &str, value: &Label| {
@@ -2801,6 +2811,9 @@ fn build_preview_pane(labels: &PreviewLabels) -> Box {
         let v = value.clone();
         v.set_hexpand(true);
         v.set_xalign(0.0);
+        // Top-align so a wrapped value keeps its key at the first line and short
+        // rows add no vertical padding.
+        v.set_valign(Align::Start);
         v.set_selectable(true);
         grid.attach(&v, 1, row, 1, 1);
     };
@@ -2904,6 +2917,7 @@ fn set_body_with_highlight(buffer: &sv::Buffer, text: &str) {
 fn make_header_key(text: &str) -> Label {
     let label = Label::new(Some(text));
     label.set_xalign(1.0);
+    label.set_valign(Align::Start);
     label.add_css_class("dim-label");
     label
 }
@@ -2989,6 +3003,9 @@ const PILL_BASE_CSS: &str = "\
 .chips > flowboxchild { padding: 0; min-height: 0; min-width: 0; }
 .pill { border-radius: 9px; padding: 1px 8px; font-size: 0.9em; }
 .pill-dim { background-color: alpha(@theme_fg_color, 0.08); color: alpha(@theme_fg_color, 0.55); }
+.chip-field, .chip-field viewport { min-height: 0; }
+.chip-field scrollbar { min-height: 0; min-width: 0; }
+.chip-field scrollbar slider { min-height: 0; min-width: 0; }
 ";
 
 /// The seven palette names accepted in a contact group's `color`, mapped to
@@ -3116,6 +3133,13 @@ fn make_chip_field(expanded: bool) -> ChipField {
     // Cap the natural height so a message with many recipients does not demand
     // a tall window; beyond this the field scrolls (see `apply_chip_expand`).
     scroll.set_max_content_height(CHIP_FIELD_MAX_HEIGHT);
+    // Top-align and tag for the CSS that zeroes the scrollbar's minimum slider
+    // length. An Automatic vertical scrollbar otherwise reserves ~40px as the
+    // field's minimum height, so a one-line From/To floats in empty space above
+    // the next field. Overlay scrolling keeps the bar from reserving width too.
+    scroll.set_valign(Align::Start);
+    scroll.set_overlay_scrolling(true);
+    scroll.add_css_class("chip-field");
     scroll.set_child(Some(&flow));
     let field = ChipField { flow, scroll };
     apply_chip_expand(&field.scroll, expanded);
@@ -3137,6 +3161,23 @@ fn apply_chip_expand(scroll: &ScrolledWindow, expanded: bool) {
         scroll.set_policy(PolicyType::Never, PolicyType::Automatic);
     } else {
         scroll.set_policy(PolicyType::External, PolicyType::Never);
+    }
+}
+
+/// Uniform vertical gap between preview header fields (From/To/Cc/Subject/…),
+/// applied the same collapsed or expanded so the spacing stays consistent.
+const HEADER_ROW_SPACING: u32 = 6;
+
+/// Match the Subject line to the expand toggle: collapsed truncates to a single
+/// ellipsized line so every header field is one line tall; expanded wraps the
+/// full subject over as many lines as needed.
+fn apply_subject_expand(label: &Label, expanded: bool) {
+    if expanded {
+        label.set_ellipsize(gtk4::pango::EllipsizeMode::None);
+        label.set_wrap(true);
+    } else {
+        label.set_wrap(false);
+        label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
     }
 }
 
