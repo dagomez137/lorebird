@@ -22,7 +22,57 @@
           });
     in
     {
-      devShells = forAllSystems ({ pkgs, system }: {
+      devShells = forAllSystems ({ pkgs, system }:
+        let
+          # The Nix closure ships no usable fontconfig config on macOS, so
+          # fontconfig sees a single fallback (DejaVu Sans) and Pango renders
+          # the whole UI in it, which looks thin and poorly defined. This
+          # self-contained config exposes the macOS system font directories and
+          # maps the generic families Pango asks for onto native faces
+          # (Helvetica Neue for sans, Menlo for monospace), with slight hinting
+          # for crisp text. Applied only on Darwin via the shellHook below.
+          macFontsConf = pkgs.writeText "lorebird-fonts.conf" ''
+            <?xml version="1.0"?>
+            <!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
+            <fontconfig>
+              <dir>/System/Library/Fonts</dir>
+              <dir>/System/Library/Fonts/Supplemental</dir>
+              <dir>/Library/Fonts</dir>
+              <dir>~/Library/Fonts</dir>
+              <cachedir prefix="xdg">fontconfig</cachedir>
+
+              <match target="pattern"><test name="family"><string>mono</string></test>
+                <edit name="family" mode="assign" binding="same"><string>monospace</string></edit></match>
+              <match target="pattern"><test name="family"><string>sans</string></test>
+                <edit name="family" mode="assign" binding="same"><string>sans-serif</string></edit></match>
+
+              <alias><family>sans-serif</family>
+                <prefer><family>Helvetica Neue</family><family>Helvetica</family></prefer></alias>
+              <alias><family>system-ui</family>
+                <prefer><family>Helvetica Neue</family><family>Helvetica</family></prefer></alias>
+              <alias><family>serif</family>
+                <prefer><family>Times New Roman</family><family>Times</family></prefer></alias>
+              <alias><family>monospace</family>
+                <prefer><family>Menlo</family><family>Monaco</family></prefer></alias>
+
+              <!-- GTK4 on macOS can only use its GL renderer here (the cairo
+                   renderer clips lines, and this GTK build has no Vulkan), and
+                   the GL path draws unhinted text soft and ill-defined. The
+                   macOS system fonts (Helvetica Neue, Menlo) ship good embedded
+                   TrueType hints, so use full native hinting (not the
+                   autohinter) to grid-fit glyph edges to the pixel for crisp,
+                   well-defined text. Grayscale antialiasing (no subpixel). -->
+              <match target="font">
+                <edit name="antialias" mode="assign"><bool>true</bool></edit>
+                <edit name="hinting" mode="assign"><bool>true</bool></edit>
+                <edit name="hintstyle" mode="assign"><const>hintfull</const></edit>
+                <edit name="autohint" mode="assign"><bool>false</bool></edit>
+                <edit name="rgba" mode="assign"><const>none</const></edit>
+              </match>
+            </fontconfig>
+          '';
+        in
+        {
         default = pkgs.mkShell {
           name = "lorebird-dev";
 
@@ -46,6 +96,9 @@
           ];
 
           shellHook = ''
+            ${pkgs.lib.optionalString pkgs.stdenv.isDarwin ''
+              export FONTCONFIG_FILE=${macFontsConf}
+            ''}
             echo "=== lorebird dev shell ==="
             echo "Rust:  $(rustc --version)"
             echo "GTK4:  ${pkgs.gtk4.version}"
